@@ -46,6 +46,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Initialize real-time data structure in session state
+if 'rt_data' not in st.session_state:
+    st.session_state.rt_data = {}
+
 # Add custom CSS to remove white background from all metric cards
 st.markdown("""
 <style>
@@ -117,22 +121,16 @@ def update_rt_data_safely(ticker, key, value):
         bool: True if update was successful, False otherwise
     """
     try:
-        # Skip if we don't have a session state (shouldn't happen in Streamlit)
+        # Skip if we don't have a session state (common in background threads)
         if not hasattr(st, 'session_state'):
-            print(f"Warning: No Streamlit session state available. Cannot update {ticker}.{key}")
             return False
             
-        # Initialize logging if not available
-        logger = st.session_state.get('logger', logging.getLogger(__name__))
-        
         # Initialize rt_data if it doesn't exist
         if 'rt_data' not in st.session_state:
-            logger.debug("Initializing rt_data in session state")
             st.session_state.rt_data = {}
             
         # Initialize ticker data if it doesn't exist
         if ticker not in st.session_state.rt_data:
-            logger.debug(f"Initializing data for ticker: {ticker}")
             st.session_state.rt_data[ticker] = {
                 'status': 'Initialized',
                 'last_update': None,
@@ -143,7 +141,6 @@ def update_rt_data_safely(ticker, key, value):
             }
         
         # Update the value
-        old_value = st.session_state.rt_data[ticker].get(key, None)
         st.session_state.rt_data[ticker][key] = value
         
         # Always update the last_update timestamp
@@ -151,18 +148,10 @@ def update_rt_data_safely(ticker, key, value):
         st.session_state.rt_data[ticker]['last_update'] = update_time
         st.session_state.rt_data[ticker]['timestamp'] = update_time
         
-        # Log the update (but not for high-frequency updates like price ticks)
-        if key not in ['price', 'volume']:
-            logger.debug(f"Updated {ticker}.{key}: {old_value} -> {value}")
-            
         return True
         
-    except Exception as e:
-        error_msg = f"Error updating real-time data for {ticker}.{key}: {str(e)}"
-        if 'logger' in st.session_state:
-            st.session_state.logger.error(error_msg, exc_info=True)
-        else:
-            print(error_msg)  # Fallback logging if logger not available
+    except Exception:
+        # Don't log errors in background threads to avoid cluttering the output
         return False
 
 # Configure logging before other operations
