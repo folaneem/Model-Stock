@@ -98,7 +98,7 @@ from dotenv import load_dotenv
 from plotly.subplots import make_subplots
 from scipy.optimize import minimize
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from tensorflow.keras.callbacks import Callback
+from keras.callbacks import Callback
 
 # Local application imports
 from utils.data_collector import DataCollector
@@ -2012,6 +2012,7 @@ class RealTimeDataHandler:
             self.last_error = str(e)
             self.logger.error(f"WebSocket connection error: {str(e)}", exc_info=True)
             
+            wait_for_connection = True  # Define the variable with a default value
             if wait_for_connection:
                 raise
             
@@ -4165,6 +4166,8 @@ rebalance_frequency = st.sidebar.selectbox(
 
 # Initialize WebSocket manager if not already done
 if 'ws_manager' not in st.session_state:
+    from utils.websocket_manager import WebSocketManager  # Ensure this import is added at the top of the file
+    
     st.session_state.ws_manager = WebSocketManager()
     st.session_state._ws_connected = False
     st.session_state._ws_callbacks_registered = False
@@ -7610,6 +7613,14 @@ if analyze_button:
             # Data Collection
             try:
                 # First validate the ticker
+                import sys
+                import os
+                
+                # Ensure 'src' directory is in the Python module search path
+                sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+                
+                from src.data.collector import Collector  # Import the Collector class
+                collector = Collector()  # Initialize the collector object
                 if not collector.validate_ticker(ticker):
                     raise ValueError(f"Invalid or non-existent ticker: {ticker}")
 
@@ -10231,6 +10242,7 @@ if analyze_button:
                         historical_data[close_col] = historical_data[close_col].astype(
                             float)
 
+                        fig_detail = go.Figure()  # Initialize fig_detail before adding traces
                         fig_detail.add_trace(go.Scatter(
                             x=historical_data.index,
                             y=historical_data[close_col],
@@ -10468,6 +10480,27 @@ if analyze_button:
                     try:
                         # Use get_instance() to ensure proper singleton initialization
                         st.session_state.rt_handler = RealTimeDataHandler.get_instance()
+                        # Define the update_rt_data function
+                        def update_rt_data(data):
+                            """
+                            Callback function to handle real-time data updates.
+                            Updates the session state with the latest data.
+                            """
+                            ticker = data.get('symbol', 'UNKNOWN')
+                            if ticker not in st.session_state.rt_data:
+                                st.session_state.rt_data[ticker] = {
+                                    'price': None,
+                                    'change': 0,
+                                    'volume': 0,
+                                    'last_updated': None
+                                }
+                            st.session_state.rt_data[ticker].update({
+                                'price': data.get('price'),
+                                'change': data.get('change', 0),
+                                'volume': data.get('volume', 0),
+                                'last_updated': data.get('timestamp', time.strftime('%Y-%m-%d %H:%M:%S'))
+                            })
+                        
                         st.session_state.rt_handler.on_update(update_rt_data)
                         st.session_state.rt_handler.start()
                         st.session_state.logger.info("WebSocket handler started")
