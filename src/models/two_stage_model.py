@@ -3,7 +3,8 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.layers import (
     Input, LSTM, Dense, Dropout, MultiHeadAttention, 
-    LayerNormalization, BatchNormalization, Concatenate, Add
+    LayerNormalization, BatchNormalization, Concatenate, Add,
+    GlobalAveragePooling1D
 )
 from tensorflow.keras.models import Model, save_model, load_model
 from tensorflow.keras.optimizers import Adam
@@ -224,10 +225,10 @@ class TwoStagePredictor:
         )(stock_input)
         lstm1 = BatchNormalization()(lstm1)
         
-        # Second LSTM layer with better initialization
+        # Second LSTM layer with better initialization - set return_sequences=False to output a single prediction per sample
         lstm2 = LSTM(
             attention_units,
-            return_sequences=True,
+            return_sequences=False,  # Changed from True to False to output a single prediction per sample
             kernel_regularizer=tf.keras.regularizers.l2(self.l2_lambda),
             kernel_initializer=self.kernel_initializer,
             recurrent_initializer='orthogonal',
@@ -236,8 +237,10 @@ class TwoStagePredictor:
         )(lstm1)
         lstm2 = BatchNormalization()(lstm2)
         
-        # Attention layer
-        attention_out = self._create_attention_layer(lstm2, attention_units)
+        # No need for attention layer on a single output vector
+        # attention_out = self._create_attention_layer(lstm2, attention_units)
+        # Use lstm2 output directly since it's now a single vector per sample
+        attention_out = lstm2
         
         # If additional features are provided, concatenate them
         if features_shape is not None:
@@ -248,6 +251,10 @@ class TwoStagePredictor:
             features_dense = BatchNormalization()(features_dense)
             
             # Ensure shapes match before concatenation
+            if len(features_dense.shape) > len(attention_out.shape):
+                # If features_dense has more dimensions, reduce them
+                features_dense = GlobalAveragePooling1D()(features_dense)
+                
             if features_dense.shape[-1] != attention_out.shape[-1]:
                 features_dense = Dense(attention_units)(features_dense)
                 
@@ -1189,15 +1196,33 @@ class TwoStagePredictor:
                 n_samples = stock_data.shape[0]
                 
                 # Ensure predictions is 2D for inverse transform
-                if predictions_scaled.ndim > 2:
-                    # If we have multiple predictions per sample, take the last one
-                    if predictions_scaled.shape[1] > 1:
-                        self.logger.info(f"Taking last prediction from shape {predictions_scaled.shape}")
-                        predictions_scaled = predictions_scaled[:, -1, :]  # Take last prediction for each sample
-                    else:
-                        predictions_scaled = predictions_scaled.reshape(-1, 1)
-                elif predictions_scaled.ndim == 1:
+                original_shape = predictions_scaled.shape
+                self.logger.info(f"Original prediction shape: {original_shape}")
+                
+                # With the updated model architecture (return_sequences=False), the output should be 2D (samples, features)
+                # But we still need to handle any unexpected shapes for robustness
+                
+                # Check prediction shape and ensure it's 2D (samples, 1) for inverse transform
+                if predictions_scaled.ndim == 1:
+                    # 1D output: reshape to 2D for inverse transform
+                    self.logger.info(f"Reshaping 1D predictions with shape {predictions_scaled.shape} to 2D")
                     predictions_scaled = predictions_scaled.reshape(-1, 1)
+                elif predictions_scaled.ndim > 2:
+                    # This shouldn't happen with the new architecture, but handle it just in case
+                    self.logger.warning(f"Unexpected 3D+ prediction shape: {predictions_scaled.shape}. Model should output 2D with return_sequences=False.")
+                    # Take the last timestep if we somehow still have sequence output
+                    if predictions_scaled.shape[1] > 1:
+                        self.logger.info(f"Taking last timestep from unexpected sequence output with shape {predictions_scaled.shape}")
+                        predictions_scaled = predictions_scaled[:, -1, :]
+                    if predictions_scaled.ndim > 2:
+                        # Reshape to 2D if still more than 2 dimensions
+                        predictions_scaled = predictions_scaled.reshape(n_samples, -1)
+                        # If multiple features, take only the first one
+                        if predictions_scaled.shape[1] > 1:
+                            self.logger.warning(f"Multiple features in output ({predictions_scaled.shape[1]}). Taking only first feature.")
+                            predictions_scaled = predictions_scaled[:, 0].reshape(-1, 1)
+                
+                self.logger.info(f"Final prediction shape for inverse transform: {predictions_scaled.shape}")
                 
                 # Ensure we have the correct number of predictions
                 if len(predictions_scaled) != n_samples:
@@ -1207,6 +1232,11 @@ class TwoStagePredictor:
                     else:
                         padding = np.zeros((n_samples - len(predictions_scaled), 1))
                         predictions_scaled = np.vstack([predictions_scaled, padding])
+                        
+                # Ensure predictions_scaled is exactly (n_samples, 1) for inverse transform
+                if predictions_scaled.shape != (n_samples, 1):
+                    self.logger.warning(f"Reshaping predictions from {predictions_scaled.shape} to ({n_samples}, 1) for inverse transform")
+                    predictions_scaled = predictions_scaled.reshape(n_samples, 1)
                 
                 # Log reshaped predictions
                 self.logger.info(f"Reshaped predictions for inverse transform: {predictions_scaled.shape}, "
