@@ -4178,7 +4178,7 @@ if 'rt_data' not in st.session_state:
 # Input form
 st.sidebar.subheader("Stock Selection")
 # Define the list of available tickers
-available_tickers = ["GOOGL", "META", "MSFT", "SPY", "AMZN", "AAPL"]
+available_tickers = ["GOOGL", "META", "MSFT", "AMZN", "AAPL"]
 
 # Initialize ticker in session state if it doesn't exist
 if 'ticker' not in st.session_state:
