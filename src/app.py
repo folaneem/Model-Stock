@@ -695,13 +695,6 @@ def clear_cache():
     except Exception as e:
         st.error(f"Error clearing cache: {str(e)}")
 
-# Add cache management to sidebar
-with st.sidebar.expander("Advanced Settings"):
-    st.write("### Data Cache Management")
-    if st.button("Clear Cache"):
-        clear_cache()
-    st.caption("Clearing the cache will force the app to download fresh data.")
-
 # Function to get the close column name for a specific ticker
 
 
@@ -4142,21 +4135,33 @@ if 'rt_data' not in st.session_state:
 
 # Input form
 st.sidebar.subheader("Stock Selection")
-ticker = st.sidebar.text_input("Enter Stock Ticker (e.g., AAPL)", "AAPL")
+# Define the list of available tickers
+available_tickers = ["GOOGL", "META", "MSFT", "SPY", "AMZN", "AAPL"]
 
-# Store ticker in session state
-if ticker:
+# Initialize ticker in session state if it doesn't exist
+if 'ticker' not in st.session_state:
+    st.session_state.ticker = available_tickers[0]  # Default to first option
+
+# Create a selectbox for ticker selection
+ticker = st.sidebar.selectbox(
+    "Select Stock Ticker",
+    options=available_tickers,
+    index=available_tickers.index(st.session_state.ticker) if st.session_state.ticker in available_tickers else 0,
+    format_func=lambda x: x  # Display the ticker as is
+)
+
+# Update session state if ticker changes
+if ticker != st.session_state.ticker:
     st.session_state.ticker = ticker
+    st.session_state.analysis_complete = False  # Force re-analysis for new ticker
+    st.rerun()  # Rerun to update the app with new ticker
+
+# Ensure ticker is always in uppercase for consistency
+st.session_state.ticker = str(st.session_state.ticker).upper()
 prediction_days = st.sidebar.slider("Prediction Days", 1, 30, 7)
 start_date = st.sidebar.date_input(
     "Start Date", datetime.now() - timedelta(days=365))
 end_date = st.sidebar.date_input("End Date", datetime.now())
-
-# Risk parameters
-st.sidebar.subheader("Risk Parameters")
-max_risk_per_trade = st.sidebar.slider("Max Risk per Trade (%)", 1.0, 5.0, 2.0, step=1.0)
-initial_capital = st.sidebar.number_input(
-    "Initial Capital ($)", min_value=1000.0, max_value=10000000.0, value=1000.0, step=1000.0, format="%.0f")
 
 # Portfolio parameters
 st.sidebar.subheader("Portfolio Parameters")
@@ -5404,12 +5409,16 @@ def run_analysis(ticker: str, start_date: datetime, end_date: datetime):
                 st.warning(f"Could not generate future predictions: {str(e)}")
         
         # 6. Portfolio optimization and risk metrics
+        portfolio_metrics = {}
         with st.spinner("📈 Optimizing portfolio..."):
             try:
                 if 'portfolio_optimizer' not in st.session_state:
                     st.session_state.portfolio_optimizer = PortfolioOptimizer()
                 
                 # Prepare returns data for portfolio optimization
+                if 'returns' not in processed_data or processed_data['returns'] is None:
+                    raise ValueError("No returns data available for portfolio optimization")
+                
                 # Convert to 1D array if it's 2D
                 returns_series = pd.Series(processed_data['returns'].squeeze() if len(processed_data['returns'].shape) > 1 else processed_data['returns'])
                 
@@ -5418,44 +5427,104 @@ def run_analysis(ticker: str, start_date: datetime, end_date: datetime):
                     ticker: returns_series
                 })
                 
-                # Optimize portfolio
-                weights = st.session_state.portfolio_optimizer.optimize_portfolio(returns_df)
+                # Ensure we have valid returns data
+                if returns_df.empty or returns_df.isnull().all().all():
+                    raise ValueError("No valid returns data available for optimization")
                 
-                # Calculate additional risk metrics
-                if isinstance(weights, dict):
-                    # Convert weights to numpy array in the same order as returns_df columns
-                    weights_array = np.array([weights.get(ticker, 0) for ticker in returns_df.columns])
+                # Fill any remaining NaN values with 0
+                returns_df = returns_df.fillna(0)
+                
+                # Store the returns data for later use
+                st.session_state.returns_df = returns_df
+                
+                # Optimize portfolio
+                weights = st.session_state.portfolio_optimizer.optimize(returns_df)
+                
+                if weights is not None:
+                    # Convert weights to a dictionary with the ticker as key
+                    weights_dict = {ticker: float(w) for ticker, w in zip(returns_df.columns, weights)}
                     
-                    # Calculate metrics
-                    portfolio_metrics = {
-                        'weights': weights,
-                        'sharpe_ratio': st.session_state.portfolio_optimizer.calculate_sharpe_ratio(
+                    # Calculate metrics with error handling
+                    try:
+                        sharpe_ratio = st.session_state.portfolio_optimizer.calculate_sharpe_ratio(
                             returns_df, 
-                            weights_array
-                        ),
-                        'volatility': st.session_state.portfolio_optimizer.calculate_volatility(
-                            returns_df,
-                            weights_array
-                        ),
-                        'max_drawdown': st.session_state.portfolio_optimizer.calculate_max_drawdown(
-                            returns_df,
-                            weights_array
+                            weights
                         )
-                    }
+                        volatility = st.session_state.portfolio_optimizer.calculate_volatility(
+                            returns_df,
+                            weights
+                        )
+                        max_drawdown = st.session_state.portfolio_optimizer.calculate_max_drawdown(
+                            returns_df,
+                            weights
+                        )
+                        
+                        # Calculate metrics with explicit type conversion and error handling
+                        try:
+                            expected_return = float(np.sum(returns_df.mean() * weights) * 252)  # Annualized
+                            sharpe_val = float(sharpe_ratio) if not np.isnan(sharpe_ratio) else 0.0
+                            vol = float(volatility) if not np.isnan(volatility) else 0.0
+                            mdd = float(max_drawdown) if not np.isnan(max_drawdown) else 0.0
+                            current_price = float(stock_data[close_col].iloc[-1]) if not stock_data.empty and close_col in stock_data.columns else 0.0
+                            div_ratio = 1.0 / sum(w**2 for w in weights) if sum(weights) > 0 else 0.0
+                            
+                            portfolio_metrics = {
+                                'weights': {k: float(v) for k, v in weights_dict.items()},  # Ensure all weights are floats
+                                'expected_return': expected_return,
+                                'sharpe_ratio': sharpe_val,
+                                'volatility': vol,
+                                'max_drawdown': mdd,
+                                'ticker': str(ticker),  # Ensure ticker is a string
+                                'current_price': current_price,
+                                'diversification_ratio': float(div_ratio)
+                            }
+                            logger.info(f"Successfully created portfolio_metrics with keys: {list(portfolio_metrics.keys())}")
+                        except Exception as calc_error:
+                            logger.error(f"Error calculating portfolio metrics: {str(calc_error)}", exc_info=True)
+                            raise
+                        
+                        logger.info(f"Portfolio optimization successful. Sharpe Ratio: {sharpe_ratio:.4f}, Volatility: {volatility:.4f}")
+                        
+                    except Exception as metric_error:
+                        logger.error(f"Error calculating portfolio metrics: {str(metric_error)}", exc_info=True)
+                        raise ValueError(f"Failed to calculate portfolio metrics: {str(metric_error)}")
                 else:
                     # Fallback if optimization fails
+                    logger.warning("Portfolio optimization returned None weights")
                     portfolio_metrics = {
-                        'weights': {ticker: 1.0 for ticker in returns_df.columns},
+                        'weights': {ticker: 1.0},
+                        'expected_return': 0.0,
                         'sharpe_ratio': 0.0,
                         'volatility': 0.0,
-                        'max_drawdown': 0.0
+                        'max_drawdown': 0.0,
+                        'ticker': ticker,
+                        'current_price': float(stock_data[close_col].iloc[-1]) if not stock_data.empty and close_col in stock_data.columns else 0.0,
+                        'diversification_ratio': 1.0,
+                        'error': 'Portfolio optimization failed to generate weights'
                     }
                 
+                # Store portfolio metrics in session state
                 st.session_state.portfolio_metrics = portfolio_metrics
+                logger.info(f"Stored portfolio metrics: {list(portfolio_metrics.keys())}")
                 
             except Exception as e:
-                st.warning(f"Portfolio optimization skipped: {str(e)}")
-                logger.warning(f"Portfolio optimization error: {str(e)}")
+                error_msg = f"Portfolio optimization failed: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                st.warning(error_msg)
+                
+                # Set default metrics on error
+                portfolio_metrics = {
+                    'weights': {ticker: 1.0},
+                    'expected_return': 0.0,
+                    'sharpe_ratio': 0.0,
+                    'volatility': 0.0,
+                    'max_drawdown': 0.0,
+                    'ticker': ticker,
+                    'current_price': float(stock_data[close_col].iloc[-1]) if not stock_data.empty and close_col in stock_data.columns else 0.0,
+                    'diversification_ratio': 1.0,
+                    'error': str(e)
+                }
+                st.session_state.portfolio_metrics = portfolio_metrics
         
         # Store the ticker in session state and ensure it's a string
         st.session_state.ticker = str(ticker).upper()
@@ -5564,20 +5633,6 @@ def run_analysis(ticker: str, start_date: datetime, end_date: datetime):
         st.session_state.analysis_complete = False
         return False
 
-# Add analysis button
-analyze_button = st.sidebar.button("Analyze")
-
-# Add cache info to sidebar
-with st.sidebar.expander("Cache Info"):
-    try:
-        cache_files = [f for f in os.listdir(data_cache_dir) if f.endswith('.pkl')]
-        st.write(f"**Cached Symbols:** {len(cache_files)}")
-        if cache_files:
-            st.write("**Oldest File:**", min(cache_files, key=lambda x: os.path.getmtime(os.path.join(data_cache_dir, x))))
-            st.write("**Newest File:**", max(cache_files, key=lambda x: os.path.getmtime(os.path.join(data_cache_dir, x))))
-    except Exception as e:
-        st.warning(f"Could not read cache info: {str(e)}")
-
 # Add risk management settings to sidebar
 with st.sidebar.expander("Risk Management Settings"):
     # Initialize RiskManager in session state if not present
@@ -5599,7 +5654,16 @@ with st.sidebar.expander("Risk Management Settings"):
     """)
     st.markdown("---")
     
-    # Current Capital input
+    # Capital inputs
+    initial_capital = st.number_input(
+        "Initial Capital ($)",
+        min_value=1000.0,
+        value=risk_manager.initial_capital,
+        step=1000.0,
+        format="%.0f",
+        key="sidebar_initial_capital"
+    )
+    
     current_capital = st.number_input(
         "Current Capital ($)",
         min_value=1000.0,
@@ -5607,6 +5671,16 @@ with st.sidebar.expander("Risk Management Settings"):
         step=1000.0,
         format="%.0f",
         key="sidebar_current_capital"
+    )
+    
+    max_risk_per_trade = st.slider(
+        "Max Risk per Trade (%)", 
+        min_value=0.1, 
+        max_value=10.0, 
+        value=risk_manager.max_risk_per_trade * 100,
+        step=0.1,
+        format="%.1f%%",
+        key="sidebar_max_risk"
     )
     
     # Volatility Multipliers
@@ -5636,13 +5710,28 @@ with st.sidebar.expander("Risk Management Settings"):
     
     # Update button
     if st.button("Update Risk Settings"):
-        # Update risk manager settings
-        risk_manager.current_capital = current_capital
-        
-        # Display success message
-        st.success("Risk management settings updated successfully!")
-        st.session_state.logger.info(f"Updated risk management settings: Capital=${current_capital:,.0f}, Max Risk={max_risk_per_trade*100:.0f}%")
+        try:
+            # Update risk manager settings directly
+            risk_manager.initial_capital = initial_capital
+            risk_manager.current_capital = current_capital
+            risk_manager.max_risk_per_trade = max_risk_per_trade / 100  # Convert from percentage to decimal
+            
+            # Log the update
+            st.session_state.logger.info(
+                f"Updated risk management settings: "
+                f"Initial Capital=${initial_capital:,.0f}, "
+                f"Current Capital=${current_capital:,.0f}, "
+                f"Max Risk={max_risk_per_trade:.1f}%"
+            )
+            
+            # Display success message
+            st.success("Risk management settings updated successfully!")
+        except Exception as e:
+            st.error(f"Error updating risk settings: {str(e)}")
+            st.session_state.logger.error(f"Error updating risk settings: {str(e)}", exc_info=True)
 
+# Add analysis button
+analyze_button = st.sidebar.button("Analyze")
 
 # Initialize predictor in session state if not exists
 if 'predictor' not in st.session_state:
@@ -6110,14 +6199,30 @@ if show_tabs:
                         # Display metrics in columns
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.metric("Position Value", f"${position_value:,.2f}")
-                            st.metric("Risk Amount", f"${risk_amount:,.2f}")
+                            st.metric("Risk Amount", f"${risk_amount:.2f}")
+                            st.metric("Position Value", f"${position_value:.2f}")
                         with col2:
-                            st.metric("Reward Amount", f"${reward_amount:,.2f}")
-                            st.metric("Risk %", f"{risk_percentage:.2f}%")
+                            st.metric("Reward Amount", f"${reward_amount:.2f}")
+                            st.metric("Risk Percentage", f"{risk_percentage:.2f}%")
                         with col3:
                             st.metric("Risk-Reward Ratio", f"{risk_reward_ratio:.2f}")
-                            st.metric("Position Size", f"{quantity:,} shares")
+                            st.metric("Position Size", f"{quantity} shares")
+                        
+                        # Display recommended position size based on risk management
+                        st.markdown("---")
+                        st.subheader("Risk Management Recommendations")
+                        
+                        # Calculate recommended position size using RiskManager
+                        recommended_size = risk_manager.calculate_position_size(ticker, entry_price, stop_loss_price)
+                        max_risk_amount = risk_manager.current_capital * risk_manager.max_risk_per_trade
+                        
+                        rec_col1, rec_col2 = st.columns(2)
+                        with rec_col1:
+                            st.metric("Recommended Position Size", f"{int(recommended_size)} shares")
+                            st.caption("Based on your risk settings")
+                        with rec_col2:
+                            st.metric("Max Risk Amount", f"${max_risk_amount:.2f}")
+                            st.caption(f"{risk_manager.max_risk_per_trade*100:.1f}% of capital")
                         
                         # Create a visual representation of the position
                         st.subheader("Position Visualization")
@@ -6236,17 +6341,21 @@ if show_tabs:
                     stop loss/take profit calculations, and overall risk exposure across your portfolio.""")
                     st.markdown("---")
                     
-                    # Get risk parameters from sidebar
+                    # Get risk parameters from sidebar and update risk manager
                     initial_capital = st.session_state.get('sidebar_initial_capital', risk_manager.initial_capital)
                     current_capital = st.session_state.get('sidebar_current_capital', risk_manager.current_capital)
                     max_risk_per_trade = st.session_state.get('sidebar_max_risk', risk_manager.max_risk_per_trade)
                     stop_loss_multiplier = st.session_state.get('sidebar_sl_multiplier', 2.0)
                     take_profit_multiplier = st.session_state.get('sidebar_tp_multiplier', 3.0)
                     
+                    # Update risk manager with current values
+                    risk_manager.initial_capital = float(initial_capital)
+                    risk_manager.current_capital = float(current_capital)
+                    risk_manager.max_risk_per_trade = float(max_risk_per_trade)
+                    
                     # Display current settings from sidebar
                     st.info("Risk settings are configured in the sidebar")
                     st.markdown("### Current Risk Settings")
-                    
                     # Display risk metrics in a table
                     risk_metrics_df = pd.DataFrame([
                         {"Parameter": "Initial Capital", "Value": f"${initial_capital:,.2f}"},
@@ -6300,14 +6409,276 @@ if show_tabs:
         st.subheader("Portfolio Analysis")
         
         # Add description
-        st.markdown("""This tab provides a comprehensive analysis of your investment portfolio, including asset allocation, 
-        diversification metrics, and performance attribution. It helps you understand how your investments work together, 
-        identify concentration risks, and optimize your portfolio for better risk-adjusted returns.""")
+        st.markdown("""This tab provides an overview of your portfolio's composition and key performance metrics.""")
         st.markdown("---")
         
-        # Check if analysis results are available
-        if 'analysis_results' not in st.session_state or not st.session_state.analysis_results:
-            st.warning("Analysis results not found. Please run the analysis first.")
+        # Debug info button in sidebar
+        if st.sidebar.button("🐞 Debug Portfolio"):
+            debug_info = {
+                'portfolio_metrics_exists': 'portfolio_metrics' in st.session_state,
+                'portfolio_metrics_keys': list(st.session_state.get('portfolio_metrics', {}).keys()) if 'portfolio_metrics' in st.session_state else 'N/A',
+                'analysis_results_exists': 'analysis_results' in st.session_state,
+                'ticker': st.session_state.get('ticker', 'N/A'),
+                'has_returns_df': 'returns_df' in st.session_state,
+                'has_optimizer': 'portfolio_optimizer' in st.session_state,
+                'returns_df_shape': st.session_state.get('returns_df', pd.DataFrame()).shape if 'returns_df' in st.session_state else 'N/A'
+            }
+            st.sidebar.json(debug_info)
+        
+        # Safely get values with defaults and type conversion
+        def safe_get_float(metrics, key, default=0.0):
+            try:
+                value = metrics.get(key, default)
+                if value is None:
+                    return default
+                return float(value)
+            except (TypeError, ValueError) as e:
+                st.session_state.logger.warning(f"Error converting {key} to float: {str(e)}")
+                return default
+        
+        # Get portfolio metrics from session state with debug logging
+        if 'portfolio_metrics' not in st.session_state:
+            st.warning("⚠️ Portfolio metrics not found in session state. Creating default metrics.")
+            # Create default metrics if they don't exist
+            ticker = st.session_state.get('ticker', 'UNKNOWN')
+            st.session_state.portfolio_metrics = {
+                'weights': {ticker: 1.0},
+                'expected_return': 0.0,
+                'sharpe_ratio': 0.0,
+                'volatility': 0.0,
+                'max_drawdown': 0.0
+            }
+            st.session_state.portfolio_weights = {ticker: 1.0}
+            
+        portfolio_metrics = st.session_state.portfolio_metrics
+        st.session_state.logger.info(f"Retrieved portfolio_metrics from session state. Keys: {list(portfolio_metrics.keys())}")
+        
+        # Check for required metrics and add any missing ones
+        required_metrics = ['weights', 'expected_return', 'sharpe_ratio', 'volatility', 'max_drawdown']
+        missing_metrics = [m for m in required_metrics if m not in portfolio_metrics]
+        
+        if missing_metrics:
+            st.warning(f"Adding missing portfolio metrics: {', '.join(missing_metrics)}")
+            # Add any missing metrics with default values
+            ticker = st.session_state.get('ticker', 'UNKNOWN')
+            for metric in missing_metrics:
+                if metric == 'weights':
+                    portfolio_metrics[metric] = {ticker: 1.0}
+                else:
+                    portfolio_metrics[metric] = 0.0
+            
+            # Update session state with fixed metrics
+            st.session_state.portfolio_metrics = portfolio_metrics
+        
+        # Get all metrics with safe conversion
+        expected_return = safe_get_float(portfolio_metrics, 'expected_return')
+        volatility = safe_get_float(portfolio_metrics, 'volatility')
+        sharpe_ratio = safe_get_float(portfolio_metrics, 'sharpe_ratio')
+        max_drawdown = safe_get_float(portfolio_metrics, 'max_drawdown')
+        diversification_ratio = safe_get_float(portfolio_metrics, 'diversification_ratio', 1.0)
+        current_price = safe_get_float(portfolio_metrics, 'current_price')
+        
+        # Display key metrics in columns with error handling
+        col1, col2, col3 = st.columns(3)
+        
+        try:
+            with col1:
+                st.metric("Expected Return", f"{expected_return * 100:.2f}%")
+                st.metric("Volatility", f"{volatility * 100:.2f}%")
+            
+            with col2:
+                st.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
+                st.metric("Max Drawdown", f"{max_drawdown * 100:.2f}%")
+                
+            with col3:
+                st.metric("Diversification Ratio", f"{diversification_ratio:.2f}")
+                st.metric("Current Price", f"${current_price:.2f}" if current_price > 0 else "N/A")
+        except Exception as e:
+            st.error(f"Error displaying portfolio metrics: {str(e)}")
+            st.session_state.logger.error(f"Error displaying portfolio metrics: {str(e)}", exc_info=True)
+        
+        # Add a refresh button to recalculate metrics
+        if st.button("🔄 Recalculate Portfolio Metrics"):
+            if 'returns_df' in st.session_state and 'portfolio_optimizer' in st.session_state:
+                try:
+                    st.session_state.logger.info("Recalculating portfolio metrics...")
+                    returns_df = st.session_state.returns_df
+                    optimizer = st.session_state.portfolio_optimizer
+                    weights = optimizer.optimize(returns_df)
+                    
+                    if weights is not None:
+                        weights_dict = {ticker: float(w) for ticker, w in zip(returns_df.columns, weights)}
+                        sharpe_ratio = optimizer.calculate_sharpe_ratio(returns_df, weights)
+                        volatility = optimizer.calculate_volatility(returns_df, weights)
+                        max_drawdown = optimizer.calculate_max_drawdown(returns_df, weights)
+                        
+                        # Update portfolio metrics
+                        portfolio_metrics.update({
+                            'weights': weights_dict,
+                            'expected_return': float(np.sum(returns_df.mean() * weights) * 252),
+                            'sharpe_ratio': float(sharpe_ratio) if not np.isnan(sharpe_ratio) else 0.0,
+                            'volatility': float(volatility) if not np.isnan(volatility) else 0.0,
+                            'max_drawdown': float(max_drawdown) if not np.isnan(max_drawdown) else 0.0,
+                            'diversification_ratio': 1.0 / sum(w**2 for w in weights) if sum(weights) > 0 else 1.0
+                        })
+                        st.session_state.portfolio_metrics = portfolio_metrics
+                        st.success("Portfolio metrics recalculated successfully!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error recalculating metrics: {str(e)}")
+                    st.session_state.logger.error(f"Error in recalculating metrics: {str(e)}", exc_info=True)
+        
+        weights = portfolio_metrics.get('weights', {})
+        if not weights:
+            st.warning("No portfolio weights available.")
+        else:
+            # Create a DataFrame for better display
+            weights_df = pd.DataFrame({
+                'Ticker': list(weights.keys()),
+                'Weight': [f"{w*100:.2f}%" for w in weights.values()],
+                'Allocation': list(weights.values())
+            })
+            
+            # Sort by weight in descending order
+            weights_df = weights_df.sort_values('Allocation', ascending=False)
+            
+            # Display weights in a table
+            st.dataframe(
+                weights_df[['Ticker', 'Weight']],
+                column_config={
+                    'Ticker': 'Ticker',
+                    'Weight': st.column_config.ProgressColumn(
+                        'Weight',
+                        help='Portfolio weight',
+                        format='%.2f%%',
+                        min_value=0,
+                        max_value=1.0
+                    )
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Add a pie chart for visualization
+            if len(weights) > 0:
+                fig = px.pie(
+                    weights_df,
+                    values='Allocation',
+                    names='Ticker',
+                    title='Portfolio Allocation',
+                    hole=0.3,
+                    color_discrete_sequence=px.colors.qualitative.Plotly
+                )
+                fig.update_traces(
+                    textposition='inside',
+                    textinfo='percent+label',
+                    hovertemplate='%{label}<br>%{percent}'
+                )
+                fig.update_layout(
+                    margin=dict(l=20, r=20, t=40, b=20),
+                    height=400,
+                    showlegend=False
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Display any error message if present
+        if 'error' in portfolio_metrics:
+            st.warning(f"Note: {portfolio_metrics['error']}")
+            
+        # Add debug information in expander
+        with st.expander("Debug Information"):
+            st.json({k: v for k, v in portfolio_metrics.items() if k not in ['weights', 'error']})
+            st.stop()
+            
+        # Get portfolio weights with fallback
+        portfolio_weights = st.session_state.analysis_results.get('portfolio_weights', {})
+    
+    if not portfolio_weights:
+        # Try to use the ticker as a fallback
+        ticker = st.session_state.get('ticker')
+        if ticker:
+            portfolio_weights = {ticker: 1.0}
+            st.session_state.logger.warning(f"Using fallback portfolio weights for {ticker}")
+        else:
+            st.warning("No portfolio allocation data available. Please check if the analysis ran successfully.")
+            st.stop()
+    
+        try:
+            # Calculate total allocation for validation
+            total_weight = sum(portfolio_weights.values())
+            
+            # Normalize weights if they don't sum to ~1.0 (allowing for floating point errors)
+            if not (0.99 <= total_weight <= 1.01):
+                st.warning(f"Portfolio weights sum to {total_weight:.2f}. Normalizing to 100%.")
+                portfolio_weights = {k: v/total_weight for k, v in portfolio_weights.items()}
+            
+            # Display portfolio weights
+            st.subheader("Portfolio Weights")
+            
+            weights = portfolio_metrics.get('weights', {})
+            if not weights:
+                st.warning("No portfolio weights available.")
+        except Exception as e:
+            st.error(f"Error processing portfolio weights: {str(e)}")
+            st.session_state.logger.error(f"Portfolio weights processing error: {str(e)}", exc_info=True)
+            st.stop()
+        else:
+            # Create a DataFrame for better display
+            weights_df = pd.DataFrame({
+                'Ticker': list(weights.keys()),
+                'Weight': [f"{w*100:.2f}%" for w in weights.values()],
+                'Allocation': list(weights.values())
+            })
+            
+            # Sort by weight in descending order
+            weights_df = weights_df.sort_values('Allocation', ascending=False)
+            
+            # Display weights in a table
+            st.dataframe(
+                weights_df[['Ticker', 'Weight']],
+                column_config={
+                    'Ticker': 'Ticker',
+                    'Weight': st.column_config.ProgressColumn(
+                        'Weight',
+                        help='Portfolio weight',
+                        format='%.2f%%',
+                        min_value=0,
+                        max_value=1.0
+                    )
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Add a pie chart for visualization
+            if len(weights) > 0:
+                fig = px.pie(
+                    weights_df,
+                    values='Allocation',
+                    names='Ticker',
+                    title='Portfolio Allocation',
+                    hole=0.3,
+                    color_discrete_sequence=px.colors.qualitative.Plotly
+                )
+                fig.update_traces(
+                    textposition='inside',
+                    textinfo='percent+label',
+                    hovertemplate='%{label}<br>%{percent}'
+                )
+                fig.update_layout(
+                    margin=dict(l=20, r=20, t=40, b=20),
+                    height=400,
+                    showlegend=False
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Display any error message if present
+        if 'error' in portfolio_metrics:
+            st.warning(f"Note: {portfolio_metrics['error']}")
+            
+        # Add debug information in expander
+        with st.expander("Debug Information"):
+            st.json({k: v for k, v in portfolio_metrics.items() if k not in ['weights', 'error']})
             st.stop()
             
         # Get portfolio weights with fallback
@@ -6322,8 +6693,7 @@ if show_tabs:
             else:
                 st.warning("No portfolio allocation data available. Please check if the analysis ran successfully.")
                 st.stop()
-                
-        # Display portfolio weights
+        
         try:
             # Calculate total allocation for validation
             total_weight = sum(portfolio_weights.values())
@@ -6332,25 +6702,50 @@ if show_tabs:
             if not (0.99 <= total_weight <= 1.01):
                 st.warning(f"Portfolio weights sum to {total_weight:.2f}. Normalizing to 100%.")
                 portfolio_weights = {k: v/total_weight for k, v in portfolio_weights.items()}
-                
+            
+            # Display portfolio weights
+            st.subheader("Portfolio Weights")
+            
             # Create and display the weights table
             df_weights = pd.DataFrame({
                 'Ticker': list(portfolio_weights.keys()),
                 'Weight': [w * 100 for w in portfolio_weights.values()]
-            })
+            }).sort_values('Weight', ascending=False)
             
             # Display the table with formatting
             st.dataframe(
                 df_weights.style.format({'Weight': '{:.2f}%'}),
-                use_container_width=True
+                use_container_width=True,
+                hide_index=True
             )
             
-            # Display metrics if available
+            # Display portfolio metrics
+            st.subheader("Portfolio Metrics")
             portfolio_metrics = st.session_state.analysis_results.get('portfolio_metrics', {})
+            
             if portfolio_metrics:
-                st.subheader("Portfolio Metrics")
-                metrics_df = pd.DataFrame([portfolio_metrics])
-                st.dataframe(metrics_df.style.format('{:.4f}'))
+                # Create a 2-column layout for metrics
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.metric("Expected Return (Annualized)", 
+                            f"{portfolio_metrics.get('expected_return', 0) * 100:.2f}%")
+                    st.metric("Volatility", 
+                            f"{portfolio_metrics.get('volatility', 0) * 100:.2f}%")
+                
+                with col2:
+                    st.metric("Sharpe Ratio", 
+                            f"{portfolio_metrics.get('sharpe_ratio', 0):.2f}")
+                    st.metric("Diversification Ratio", 
+                            f"{portfolio_metrics.get('diversification_ratio', 0):.2f}")
+                
+                # Display current price and ticker if available
+                if 'current_price' in portfolio_metrics and 'ticker' in portfolio_metrics:
+                    st.metric("Current Price", 
+                            f"${portfolio_metrics.get('current_price', 0):.2f}",
+                            portfolio_metrics.get('ticker', ''))
+            else:
+                st.warning("No portfolio metrics available. Please ensure the analysis completed successfully.")
                 
         except Exception as e:
             st.error(f"Error displaying portfolio analysis: {str(e)}")
@@ -7955,14 +8350,26 @@ if analyze_button:
                 error_msg = f"Error in model training and prediction: {str(e)}"
                 st.session_state.logger.error(error_msg, exc_info=True)
                 st.error(error_msg)
-                # Re-raise to stop further execution if needed
-                raise
 
             # Portfolio Optimization
             try:
                 # For single-ticker optimization, we'll create a simple portfolio with the selected ticker
                 # and a benchmark (like SPY) for comparison
                 benchmark_ticker = 'SPY'
+                
+                # Initialize default portfolio metrics for single ticker
+                portfolio_weights = {ticker: 1.0}
+                portfolio_metrics = {
+                    'weights': {ticker: 1.0},
+                    'expected_return': 0.0,
+                    'sharpe_ratio': 0.0,
+                    'volatility': 0.0,
+                    'max_drawdown': 0.0
+                }
+                
+                # Store in session state immediately to ensure it's available
+                st.session_state.portfolio_metrics = portfolio_metrics
+                st.session_state.portfolio_weights = portfolio_weights
                 
                 # Debug: Log available columns and first few rows of stock data
                 st.session_state.logger.info(f"Available columns in stock_data_clean: {stock_data_clean.columns.tolist()}")
@@ -8004,7 +8411,8 @@ if analyze_button:
                     st.warning(f"Skipping portfolio optimization due to invalid price data (value: {current_price})")
                     portfolio_weights = {ticker: 1.0}
                     portfolio_metrics = {
-                        'weights': np.array([1.0]),
+                        'weights': {ticker: 1.0},
+                        'expected_return': 0.0,
                         'sharpe_ratio': 0.0,
                         'volatility': 0.0,
                         'max_drawdown': 0.0
@@ -8035,7 +8443,103 @@ if analyze_button:
                     
                     # If benchmark data is empty, use default weights
                     if benchmark_data.empty:
-                        st.warning(f"No benchmark data available for {benchmark_ticker}")
+                        st.warning(f"No benchmark data available for {benchmark_ticker}. Using single-asset portfolio.")
+                        portfolio_weights = {ticker: 1.0}
+                        portfolio_metrics = {
+                            'weights': {ticker: 1.0},
+                            'expected_return': 0.0,
+                            'sharpe_ratio': 0.0,
+                            'volatility': 0.0,
+                            'max_drawdown': 0.0
+                        }
+                        # Store the metrics in session state
+                        st.session_state.portfolio_metrics = portfolio_metrics
+                        st.session_state.portfolio_weights = portfolio_weights
+                        # Store data in session state
+                        st.session_state.stock_data = stock_data
+                        st.session_state.processed_data = processed_data
+                        st.session_state.predictions = predictions
+                        st.session_state.metrics = metrics
+                        # Skip the rest of the optimization
+                        benchmark_data = None  # This will prevent further processing in this block
+                    
+                    # Calculate returns for both assets - ensure we have the right column names
+                    benchmark_close_col = 'Close' if 'Close' in benchmark_data.columns else benchmark_data.filter(like='Close').columns[0]
+                    benchmark_returns = benchmark_data[benchmark_close_col].pct_change().dropna()
+                    
+                    try:
+                        # Get the close column for the main ticker with debug logging
+                        st.session_state.logger.info(f"Getting close column for ticker: {ticker}")
+                        st.session_state.logger.info(f"Available columns: {stock_data_clean.columns.tolist()}")
+                        
+                        ticker_close_col = get_close_column_name(stock_data_clean, ticker)
+                        st.session_state.close_col = ticker_close_col  # Store in session state for future use
+                        
+                        st.session_state.logger.info(f"Using close column: {ticker_close_col}")
+                        
+                        # Calculate returns for both assets
+                        asset_returns = stock_data_clean[ticker_close_col].pct_change().dropna()
+                        
+                        # Ensure we have valid returns data
+                        if asset_returns.empty:
+                            raise ValueError(f"No valid returns data for {ticker} using column {ticker_close_col}")
+                            
+                        # Log returns statistics for debugging
+                        st.session_state.logger.info(
+                            f"Returns stats for {ticker} - "
+                            f"Count: {len(asset_returns)}, "
+                            f"Mean: {asset_returns.mean():.6f}, "
+                            f"Std: {asset_returns.std():.6f}, "
+                            f"Min: {asset_returns.min():.6f}, "
+                            f"Max: {asset_returns.max():.6f}"
+                        )
+                        
+                        # Ensure both returns are 1D pandas Series with proper names and indices
+                        if isinstance(benchmark_returns, (pd.Series, pd.DataFrame)):
+                            benchmark_returns = benchmark_returns.squeeze()  # Convert to Series if it's a DataFrame
+                        if isinstance(asset_returns, (pd.Series, pd.DataFrame)):
+                            asset_returns = asset_returns.squeeze()  # Convert to Series if it's a DataFrame
+                            
+                        benchmark_returns = pd.Series(
+                            np.ravel(benchmark_returns),  # Ensure 1D array
+                            name=benchmark_ticker,
+                            index=benchmark_returns.index[:len(benchmark_returns)]
+                        )
+                        
+                        asset_returns = pd.Series(
+                            np.ravel(asset_returns),  # Ensure 1D array
+                            name=ticker,
+                            index=stock_data_clean.index[1:][-len(asset_returns):]  # Align with pct_change()
+                        )
+                        
+                        # Align the returns data by index
+                        combined_returns = pd.DataFrame({
+                            ticker: asset_returns,
+                            benchmark_ticker: benchmark_returns
+                        }).dropna()
+                        
+                        # Log the first few rows of combined returns for debugging
+                        st.session_state.logger.info(f"Combined returns head (aligned):\n{combined_returns.head()}")
+                    
+                    except Exception as e:
+                        error_msg = f"Error preparing returns data: {str(e)}"
+                        st.session_state.logger.error(error_msg, exc_info=True)
+                        st.warning(f"Skipping portfolio optimization: {error_msg}")
+                        portfolio_weights = {ticker: 1.0}
+                        portfolio_metrics = {
+                            'weights': np.array([1.0]),
+                            'sharpe_ratio': 0.0,
+                            'volatility': 0.0,
+                            'max_drawdown': 0.0
+                        }
+                        combined_returns = None  # Mark as invalid to skip optimization
+                    
+                    # Skip optimization if combined_returns is None (error case)
+                    if combined_returns is None:
+                        # Already set portfolio_weights and metrics in the except block
+                        pass
+                    elif len(combined_returns) < 10:  # Minimum data points required
+                        st.warning("Not enough common data points for portfolio optimization")
                         portfolio_weights = {ticker: 1.0}
                         portfolio_metrics = {
                             'weights': np.array([1.0]),
@@ -8044,135 +8548,52 @@ if analyze_button:
                             'max_drawdown': 0.0
                         }
                     else:
-                        # Calculate returns for both assets - ensure we have the right column names
-                        benchmark_close_col = 'Close' if 'Close' in benchmark_data.columns else benchmark_data.filter(like='Close').columns[0]
-                        benchmark_returns = benchmark_data[benchmark_close_col].pct_change().dropna()
+                        # Get the common index from the combined_returns DataFrame
+                        common_index = combined_returns.index
                         
+                        # Use the aligned returns DataFrame for optimization
                         try:
-                            # Get the close column for the main ticker with debug logging
-                            st.session_state.logger.info(f"Getting close column for ticker: {ticker}")
-                            st.session_state.logger.info(f"Available columns: {stock_data_clean.columns.tolist()}")
+                            # Ensure we have a DataFrame with proper column names
+                            if not isinstance(combined_returns, pd.DataFrame):
+                                combined_returns = pd.DataFrame(combined_returns, columns=[ticker, benchmark_ticker])
                             
-                            ticker_close_col = get_close_column_name(stock_data_clean, ticker)
-                            st.session_state.close_col = ticker_close_col  # Store in session state for future use
+                            optimizer = PortfolioOptimizer()
+                            weights = optimizer.optimize(combined_returns)
                             
-                            st.session_state.logger.info(f"Using close column: {ticker_close_col}")
+                            # Calculate metrics using the combined_returns DataFrame (not .values)
+                            portfolio_metrics = {
+                                'weights': weights,
+                                'sharpe_ratio': optimizer.calculate_sharpe_ratio(combined_returns, weights),
+                                'volatility': optimizer.calculate_volatility(combined_returns, weights),
+                                'max_drawdown': optimizer.calculate_max_drawdown(combined_returns, weights)
+                            }
                             
-                            # Calculate returns for both assets
-                            asset_returns = stock_data_clean[ticker_close_col].pct_change().dropna()
-                            
-                            # Ensure we have valid returns data
-                            if asset_returns.empty:
-                                raise ValueError(f"No valid returns data for {ticker} using column {ticker_close_col}")
-                                
-                            # Log returns statistics for debugging
-                            st.session_state.logger.info(
-                                f"Returns stats for {ticker} - "
-                                f"Count: {len(asset_returns)}, "
-                                f"Mean: {asset_returns.mean():.6f}, "
-                                f"Std: {asset_returns.std():.6f}, "
-                                f"Min: {asset_returns.min():.6f}, "
-                                f"Max: {asset_returns.max():.6f}"
-                            )
-                            
-                            # Ensure both returns are 1D pandas Series with proper names and indices
-                            if isinstance(benchmark_returns, (pd.Series, pd.DataFrame)):
-                                benchmark_returns = benchmark_returns.squeeze()  # Convert to Series if it's a DataFrame
-                            if isinstance(asset_returns, (pd.Series, pd.DataFrame)):
-                                asset_returns = asset_returns.squeeze()  # Convert to Series if it's a DataFrame
-                                
-                            benchmark_returns = pd.Series(
-                                np.ravel(benchmark_returns),  # Ensure 1D array
-                                name=benchmark_ticker,
-                                index=benchmark_returns.index[:len(benchmark_returns)]
-                            )
-                            
-                            asset_returns = pd.Series(
-                                np.ravel(asset_returns),  # Ensure 1D array
-                                name=ticker,
-                                index=stock_data_clean.index[1:][-len(asset_returns):]  # Align with pct_change()
-                            )
-                            
-                            # Align the returns data by index
-                            combined_returns = pd.DataFrame({
-                                ticker: asset_returns,
-                                benchmark_ticker: benchmark_returns
-                            }).dropna()
-                            
-                            # Log the first few rows of combined returns for debugging
-                            st.session_state.logger.info(f"Combined returns head (aligned):\n{combined_returns.head()}")
-                            
-                        except Exception as e:
-                            error_msg = f"Error preparing returns data: {str(e)}"
-                            st.session_state.logger.error(error_msg, exc_info=True)
-                            st.warning(f"Skipping portfolio optimization: {error_msg}")
+                            # Map weights back to tickers
+                            portfolio_weights = {
+                                ticker: weights[0],
+                                benchmark_ticker: weights[1]
+                            }
+                        
+                        except Exception as opt_error:
+                            st.warning(f"Portfolio optimization failed: {str(opt_error)}")
                             portfolio_weights = {ticker: 1.0}
                             portfolio_metrics = {
-                                'weights': np.array([1.0]),
+                                'weights': np.array([1.0, 0.0]),
                                 'sharpe_ratio': 0.0,
                                 'volatility': 0.0,
                                 'max_drawdown': 0.0
                             }
-                            combined_returns = None  # Mark as invalid to skip optimization
-                            
-                        # Skip optimization if combined_returns is None (error case)
-                        if combined_returns is None:
-                            # Already set portfolio_weights and metrics in the except block
-                            pass
-                        elif len(combined_returns) < 10:  # Minimum data points required
-                            st.warning("Not enough common data points for portfolio optimization")
-                            portfolio_weights = {ticker: 1.0}
-                            portfolio_metrics = {
-                                'weights': np.array([1.0]),
-                                'sharpe_ratio': 0.0,
-                                'volatility': 0.0,
-                                'max_drawdown': 0.0
-                            }
-                        else:
-                            # Get the common index from the combined_returns DataFrame
-                            common_index = combined_returns.index
-                            
-                            # Use the aligned returns DataFrame for optimization
-                            try:
-                                # Ensure we have a DataFrame with proper column names
-                                if not isinstance(combined_returns, pd.DataFrame):
-                                    combined_returns = pd.DataFrame(combined_returns, columns=[ticker, benchmark_ticker])
-                                
-                                optimizer = PortfolioOptimizer()
-                                weights = optimizer.optimize(combined_returns)
-                                
-                                # Calculate metrics using the combined_returns DataFrame (not .values)
-                                portfolio_metrics = {
-                                    'weights': weights,
-                                    'sharpe_ratio': optimizer.calculate_sharpe_ratio(combined_returns, weights),
-                                    'volatility': optimizer.calculate_volatility(combined_returns, weights),
-                                    'max_drawdown': optimizer.calculate_max_drawdown(combined_returns, weights)
-                                }
-                                
-                                # Map weights back to tickers
-                                portfolio_weights = {
-                                    ticker: weights[0],
-                                    benchmark_ticker: weights[1]
-                                }
-                                
-                            except Exception as opt_error:
-                                st.warning(f"Portfolio optimization failed: {str(opt_error)}")
-                                portfolio_weights = {ticker: 1.0}
-                                portfolio_metrics = {
-                                    'weights': np.array([1.0, 0.0]),
-                                    'sharpe_ratio': 0.0,
-                                    'volatility': 0.0,
-                                    'max_drawdown': 0.0
-                                }
 
-                    if benchmark_data is None or benchmark_data.empty:
-                        raise ValueError(
-                            "No benchmark data returned from yfinance")
+                # These checks should be at the beginning of the benchmark data section
+                # Moving them up would be better, but for now just fix the indentation
+                if benchmark_data is None or benchmark_data.empty:
+                    raise ValueError(
+                        "No benchmark data returned from yfinance")
 
-                    # Ensure we have the 'Close' column
-                    if 'Close' not in benchmark_data.columns:
-                        raise ValueError(
-                            "Benchmark data missing 'Close' column")
+                # Ensure we have the 'Close' column
+                if 'Close' not in benchmark_data.columns:
+                    raise ValueError(
+                        "Benchmark data missing 'Close' column")
 
                     # Convert to DataFrame if it's a Series
                     if isinstance(benchmark_data, pd.Series):
@@ -8281,20 +8702,29 @@ if analyze_button:
                         st.session_state.logger.warning(
                             f"Benchmark data error: {str(bench_error)}")
                         st.session_state.logger.debug(f"Traceback: {detailed_error_msg}")
-                        portfolio_weights = {ticker: 1.0}
-                        # Store the single-asset weights in the optimizer instance
-                        st.session_state.portfolio_optimizer.portfolio_weights = portfolio_weights
-                        st.session_state.logger.info("Falling back to 100% allocation to selected ticker")
 
             except Exception as e:
                 error_msg = f"Error in portfolio optimization: {str(e)}"
                 st.error(error_msg)
                 st.session_state.logger.error(error_msg, exc_info=True)
                 
+                # Ensure we have default portfolio metrics even after an error
+                if 'portfolio_metrics' not in st.session_state:
+                    ticker = st.session_state.get('ticker', 'UNKNOWN')
+                    st.session_state.portfolio_metrics = {
+                        'weights': {ticker: 1.0},
+                        'expected_return': 0.0,
+                        'sharpe_ratio': 0.0,
+                        'volatility': 0.0,
+                        'max_drawdown': 0.0
+                    }
+                    st.session_state.portfolio_weights = {ticker: 1.0}
+                
                 # Fall back to 100% allocation to the selected ticker
                 portfolio_weights = {ticker: 1.0}
                 portfolio_metrics = {
                     'weights': np.array([1.0]),
+                    'expected_return': 0.0,
                     'sharpe_ratio': 0.0,
                     'volatility': 0.0,
                     'max_drawdown': 0.0

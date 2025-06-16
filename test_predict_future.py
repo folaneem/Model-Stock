@@ -13,24 +13,21 @@ from src.models.two_stage_model import TwoStagePredictor
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
 def test_predict_future():
     print("Creating test model...")
-    model = TwoStagePredictor(prediction_days=5)
-    
+    model = TwoStagePredictor(prediction_days=5)   
     print("Creating test data...")
     # Create sample data (5 days of historical data)
     last_sequence = np.random.random((5, 1))
     additional_features = np.random.random((5, 3))
-    date_index = pd.date_range(start='2025-06-10', periods=5, freq='B')
-    
+    date_index = pd.date_range(start='2025-06-10', periods=5, freq='B') 
     # Test 1: Verify that 'Model not trained' error is properly propagated
     print("\nTest 1: Verifying 'Model not trained' error is properly propagated...")
     try:
         future_preds, future_dates = model.predict_future(
-            last_sequence, 
-            additional_features, 
-            days_ahead=3, 
+            last_sequence,
+            additional_features,
+            days_ahead=3,
             date_index=date_index
         )
         print("Error: This should have raised a 'Model not trained' exception!")
