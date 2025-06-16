@@ -54,6 +54,8 @@ logs/
 *.pkl
 *.h5
 models/saved_models/
+models/ipynb_checkpoints
+./c
 
 # Environment variables
 .env
@@ -66,5 +68,3 @@ models/saved_models/
 htmlcov/
 
 # Temporary files
-tmp/
-temp/
