@@ -8455,8 +8455,13 @@ if analyze_button:
                         # Store the metrics in session state
                         st.session_state.portfolio_metrics = portfolio_metrics
                         st.session_state.portfolio_weights = portfolio_weights
-                        # Skip the rest of the optimization by returning early
-                        return stock_data, processed_data, predictions, metrics
+                        # Store data in session state
+                        st.session_state.stock_data = stock_data
+                        st.session_state.processed_data = processed_data
+                        st.session_state.predictions = predictions
+                        st.session_state.metrics = metrics
+                        # Skip the rest of the optimization
+                        benchmark_data = None  # This will prevent further processing in this block
                     
                     # Calculate returns for both assets - ensure we have the right column names
                     benchmark_close_col = 'Close' if 'Close' in benchmark_data.columns else benchmark_data.filter(like='Close').columns[0]
