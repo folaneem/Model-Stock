@@ -43,15 +43,29 @@ class WebSocketManager:
             self._lock = asyncio.Lock()
             self._initialized = True
             self._should_reconnect = True
+            self._loop = None
+            self._connect_task = None
+            self._message_task = None
+            self._shutting_down = False
     
     async def _connect(self) -> bool:
         """Establish WebSocket connection with retry logic."""
         attempts = 0
         
-        while attempts < self.max_reconnect_attempts:
+        # Close any existing connection
+        if self.ws and not self.ws.closed:
+            await self.close()
+        
+        while attempts < self.max_reconnect_attempts and self._should_reconnect:
             try:
                 logger.info(f"Connecting to WebSocket (attempt {attempts + 1}/{self.max_reconnect_attempts})")
-                self.ws = await websockets.connect(self.ws_url, ping_interval=10, ping_timeout=5)
+                # Add close_timeout to prevent hanging
+                self.ws = await websockets.connect(
+                    self.ws_url, 
+                    ping_interval=10, 
+                    ping_timeout=5,
+                    close_timeout=1
+                )
                 self.connected = True
                 logger.info("WebSocket connection established")
                 return True
@@ -62,11 +76,14 @@ class WebSocketManager:
                 
                 if attempts >= self.max_reconnect_attempts:
                     logger.error("Max connection attempts reached")
+                    self.connected = False
                     return False
                 
                 # Exponential backoff with jitter
                 delay = min(self.reconnect_delay * (2 ** (attempts - 1)), self.max_reconnect_delay)
                 await asyncio.sleep(delay)
+        
+        return False
     
     async def _authenticate(self) -> bool:
         """Authenticate with the WebSocket server."""
@@ -116,30 +133,67 @@ class WebSocketManager:
     async def start(self) -> bool:
         """Start the WebSocket connection and message loop."""
         if self.running:
+            logger.info("WebSocket is already running")
             return True
             
-        if not await self._connect():
-            return False
+        try:
+            # Ensure any existing connection is properly closed first
+            await self.stop()
             
-        if not await self._authenticate():
-            return False
+            # Reset state
+            self._shutting_down = False
+            self.running = True
             
-        self.running = True
-        asyncio.create_task(self._message_loop())
-        return True
+            # Establish new connection
+            if not await self._connect():
+                logger.error("Failed to establish WebSocket connection")
+                self.running = False
+                return False
+                
+            if not await self._authenticate():
+                logger.error("Failed to authenticate WebSocket connection")
+                self.running = False
+                if self.ws and not self.ws.closed:
+                    await self.ws.close()
+                return False
+            
+            # Start message loop in a separate task
+            self._message_task = asyncio.create_task(self._message_loop())
+            logger.info("WebSocket started successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error starting WebSocket: {str(e)}", exc_info=True)
+            self.running = False
+            if self.ws and not self.ws.closed:
+                await self.ws.close()
+            return False
     
     async def stop(self) -> None:
         """Stop the WebSocket connection and clean up resources."""
-        logger.info("Stopping WebSocket connection...")
+        if self._shutting_down:
+            return
+            
+        self._shutting_down = True
         self.running = False
         self._should_reconnect = False
         
-        # First, set flags to prevent reconnection attempts
-        self.connected = False
-        self.authenticated = False
+        logger.info("Stopping WebSocket connection...")
         
-        # Then close the WebSocket connection if it exists
-        if self.ws:
+        # Cancel the message loop task if it exists
+        if self._message_task and not self._message_task.done():
+            self._message_task.cancel()
+            try:
+                await self._message_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Error in message task during shutdown: {str(e)}")
+            finally:
+                self._message_task = None
+        
+        # Close the WebSocket connection if it exists
+        if self.ws and not self.ws.closed:
             try:
                 # Use a timeout to ensure we don't hang indefinitely
                 close_task = asyncio.create_task(self.ws.close())
@@ -151,34 +205,72 @@ class WebSocketManager:
                     logger.warning("WebSocket close operation timed out")
                 except Exception as e:
                     logger.error(f"Error closing WebSocket: {str(e)}", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error during WebSocket close: {str(e)}", exc_info=True)
             finally:
                 # Ensure we clear the reference even if close fails
                 self.ws = None
-                
-        # Clear subscribed symbols
+        
+        # Reset connection state
+        self.connected = False
+        self.authenticated = False
         self.subscribed_symbols.clear()
+        self._shutting_down = False
         
         logger.info("WebSocket connection stopped")
-        
-        # Return control to the event loop to allow pending tasks to complete
-        await asyncio.sleep(0)
     
     async def _message_loop(self) -> None:
         """Process incoming WebSocket messages."""
-        while self.running and self.ws:
+        logger.info("Starting WebSocket message loop")
+        
+        while self.running and not self._shutting_down:
             try:
-                message = await self.ws.recv()
-                data = json.loads(message)
-                await self._process_message(data)
+                if not self.ws or self.ws.closed:
+                    logger.warning("WebSocket connection not available, attempting to reconnect...")
+                    if not await self._reconnect():
+                        logger.error("Reconnection failed, stopping message loop")
+                        break
+                    continue
                 
+                try:
+                    # Use a timeout to prevent hanging on recv()
+                    message = await asyncio.wait_for(self.ws.recv(), timeout=30.0)
+                    if not message:
+                        logger.warning("Received empty message")
+                        continue
+                        
+                    data = json.loads(message)
+                    await self._process_message(data)
+                    
+                except asyncio.TimeoutError:
+                    # Send ping to keep connection alive
+                    if self.ws and not self.ws.closed:
+                        try:
+                            await self.ws.ping()
+                        except Exception as e:
+                            logger.warning(f"Ping failed: {str(e)}")
+                            await asyncio.sleep(1)  # Prevent tight loop on ping failure
+                    continue
+                    
             except websockets.exceptions.ConnectionClosed as e:
                 logger.error(f"WebSocket connection closed: {str(e)}")
-                if self._should_reconnect:
-                    await self._handle_reconnect()
+                if self._should_reconnect and not self._shutting_down:
+                    logger.info("Attempting to reconnect...")
+                    if not await self._reconnect():
+                        logger.error("Reconnection failed, stopping message loop")
+                        break
+                else:
+                    break
+                    
+            except asyncio.CancelledError:
+                logger.info("Message loop cancelled")
                 break
                 
             except Exception as e:
-                logger.error(f"Error processing WebSocket message: {str(e)}", exc_info=True)
+                logger.error(f"Error in WebSocket message loop: {str(e)}", exc_info=True)
+                await asyncio.sleep(1)  # Prevent tight loop on unexpected errors
+                
+        logger.info("WebSocket message loop ended")
     
     async def _process_message(self, data: Dict[str, Any]) -> None:
         """Process a single WebSocket message."""
@@ -210,21 +302,71 @@ class WebSocketManager:
                 await callback(data)
             except Exception as e:
                 logger.error(f"Error in WebSocket callback: {str(e)}", exc_info=True)
-    
-    async def _handle_reconnect(self) -> None:
-        """Handle reconnection logic."""
-        await self.stop()
-        await asyncio.sleep(self.reconnect_delay)
-        await self.start()
-        await self.subscribe(self.subscribed_symbols)
-    
+
+    async def _reconnect(self) -> bool:
+        """Handle reconnection logic.
+
+        Returns:
+            bool: True if reconnection was successful, False otherwise
+        """
+        if not self._should_reconnect or self._shutting_down:
+            return False
+
+        logger.info("Attempting to reconnect...")
+
+        try:
+            # Close existing connection if any
+            if self.ws and not self.ws.closed:
+                try:
+                    await self.ws.close()
+                except Exception as e:
+                    logger.warning(f"Error closing connection during reconnect: {str(e)}")
+
+            # Reset connection state
+            self.connected = False
+            self.authenticated = False
+
+            # Attempt to reconnect
+            if not await self._connect():
+                logger.error("Failed to re-establish WebSocket connection")
+                return False
+
+            if not await self._authenticate():
+                logger.error("Failed to re-authenticate WebSocket connection")
+                return False
+
+            # Resubscribe to symbols
+            if self.subscribed_symbols:
+                if not await self.subscribe(self.subscribed_symbols):
+                    logger.error("Failed to resubscribe to symbols after reconnection")
+                    return False
+
+            logger.info("Successfully reconnected and resubscribed")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error during reconnection: {str(e)}", exc_info=True)
+            return False
+
     def add_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
         """Register a callback to receive WebSocket updates."""
         self.callbacks.add(callback)
-    
+
     def remove_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
         """Remove a previously registered callback."""
         self.callbacks.discard(callback)
 
-# Global instance
-websocket_manager = WebSocketManager()
+# Global instance with proper cleanup
+_websocket_manager_instance = None
+
+def get_websocket_manager():
+    """Get or create the WebSocket manager instance with proper cleanup."""
+    global _websocket_manager_instance
+    
+    if _websocket_manager_instance is None or _websocket_manager_instance.ws is None:
+        _websocket_manager_instance = WebSocketManager()
+        
+    return _websocket_manager_instance
+
+# For backward compatibility
+websocket_manager = get_websocket_manager()

@@ -4097,13 +4097,25 @@ def safe_subscribe_handler(handler, symbols):
 
 # Initialize and manage WebSocket connection using the improved RealTimeDataHandler
 if 'rt_handler' not in st.session_state:
-    st.session_state.rt_handler = RealTimeDataHandler()
-    # Use the safe wrapper to start the handler
-    if hasattr(st.session_state.rt_handler, 'running') and not st.session_state.rt_handler.running:
-        safe_start_handler(st.session_state.rt_handler)
-    
-    st.session_state.rt_handler.add_callback(handle_ws_update)
-    logger.info("RealTimeDataHandler initialized and started")
+    try:
+        st.session_state.rt_handler = RealTimeDataHandler()
+        
+        # Register cleanup function to be called when the app is stopped or reloaded
+        if not hasattr(st, '_ws_cleanup_registered'):
+            import atexit
+            atexit.register(stop_websocket_connection)
+            st._ws_cleanup_registered = True
+        
+        # Use the safe wrapper to start the handler
+        if hasattr(st.session_state.rt_handler, 'running') and not st.session_state.rt_handler.running:
+            safe_start_handler(st.session_state.rt_handler)
+        
+        st.session_state.rt_handler.add_callback(handle_ws_update)
+        logger.info("RealTimeDataHandler initialized and started")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize WebSocket handler: {str(e)}", exc_info=True)
+        st.session_state.rt_handler = None
 
 # Function to safely start WebSocket connection (simplified)
 def start_websocket_connection() -> bool:
@@ -4118,13 +4130,43 @@ def start_websocket_connection() -> bool:
         return False
 
 # Function to safely stop WebSocket connection
-def stop_websocket_connection() -> None:
-    """Safely stop WebSocket connection."""
+def stop_websocket_connection():
+    """
+    Safely stop WebSocket connection and clean up resources.
+    This function is called on app shutdown or reload.
+    """
+    if 'rt_handler' in st.session_state and st.session_state.rt_handler:
+        try:
+            handler = st.session_state.rt_handler
+            
+            # Remove callbacks first to prevent any callbacks during shutdown
+            if hasattr(handler, 'callbacks'):
+                handler.callbacks.clear()
+                
+            # Stop the handler
+            if hasattr(handler, 'stop'):
+                handler.stop()
+                
+            # Clean up any remaining resources
+            if hasattr(handler, '_cleanup_connection'):
+                handler._cleanup_connection()
+                
+            # Clear the handler
+            st.session_state.rt_handler = None
+            logger.info("WebSocket connection and resources cleaned up")
+            
+        except Exception as e:
+            logger.error(f"Error during WebSocket cleanup: {str(e)}", exc_info=True)
+    
+    # Ensure event loop is properly closed
     try:
-        if st.session_state.rt_handler.running:
-            st.session_state.rt_handler.stop()
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.stop()
+        if not loop.is_closed():
+            loop.close()
     except Exception as e:
-        logger.error(f"Error stopping real-time data: {str(e)}", exc_info=True)
+        logger.debug(f"Event loop cleanup: {str(e)}", exc_info=True)
 
 # Initialize real-time data structure
 if 'rt_data' not in st.session_state:
@@ -7438,7 +7480,8 @@ if analyze_button:
                     error_msg = f"Invalid or non-existent ticker: {ticker}"
                     st.error(error_msg)
                     st.session_state.logger.error(error_msg)
-                    return None
+                    st.stop()  # Stop execution completely for invalid ticker
+                    return None  # This line is a safeguard, st.stop() will have already stopped execution
                 
                 # Calculate date range for logging
                 fetch_start = start_date - timedelta(days=365 * 2)  # 2 years of historical data
