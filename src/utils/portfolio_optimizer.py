@@ -43,7 +43,210 @@ class PortfolioOptimizer:
         # Numerical stability
         self.epsilon = 1e-10
         self.n_restarts = 5
+        
+        # Data validation settings
+        self.min_data_points = 60  # Minimum data points required for optimization
 
+    def optimize_portfolio(self, tickers: List[str]) -> dict:
+        """
+        Optimize portfolio allocation with proper error handling.
+        
+        Args:
+            tickers: List of ticker symbols to include in the portfolio
+            
+        Returns:
+            dict: Dictionary containing optimization results or error information
+        """
+        from ..utils.data_processor import prepare_data_for_prediction
+        from ..utils.yfinance_utils import calculate_returns
+        
+        if not tickers:
+            logger.warning("No tickers provided for optimization")
+            return {
+                "error": "No tickers provided",
+                "tickers": [],
+                "status": "error"
+            }
+        
+        # Get historical data
+        returns_data = []
+        valid_tickers = []
+        
+        for ticker in tickers:
+            try:
+                data = prepare_data_for_prediction(ticker)
+                if data is not None and not data.empty:
+                    returns = calculate_returns(data['Close'])
+                    if len(returns) > 0:
+                        returns_data.append(returns)
+                        valid_tickers.append(ticker)
+                        logger.debug(f"Added {ticker} to optimization")
+            except Exception as e:
+                logger.warning(f"Skipping {ticker} due to error: {str(e)}")
+        
+        if not valid_tickers:
+            logger.warning("No valid tickers for optimization")
+            return {
+                "error": "No valid tickers for optimization",
+                "tickers": [],
+                "status": "error"
+            }
+        
+        try:
+            # Create returns DataFrame
+            returns_df = pd.concat(returns_data, axis=1)
+            returns_df.columns = valid_tickers
+            
+            # Handle any remaining null values
+            returns_df = returns_df.fillna(0)
+            
+            # Run optimization
+            if len(valid_tickers) == 1:
+                # Special case for single asset
+                weights = np.array([1.0])
+                expected_return = returns_df.mean().iloc[0]
+                volatility = returns_df.std().iloc[0]
+                sharpe_ratio = (expected_return - self.risk_free_rate/252) / (volatility + self.epsilon)
+            else:
+                # Multiple assets
+                self.returns = returns_df
+                weights = self.optimize()
+                
+                # Calculate metrics
+                expected_return = np.sum(returns_df.mean() * weights) * 252
+                cov_matrix = returns_df.cov() * 252
+                volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+                sharpe_ratio = (expected_return - self.risk_free_rate) / (volatility + self.epsilon)
+            
+            # Prepare results
+            weights_dict = {ticker: float(w) for ticker, w in zip(valid_tickers, weights)}
+            
+            return {
+                "weights": weights_dict,
+                "tickers": valid_tickers,
+                "expected_return": float(expected_return),
+                "volatility": float(volatility),
+                "sharpe_ratio": float(sharpe_ratio),
+                "status": "success"
+            }
+            
+        except Exception as e:
+            logger.error(f"Portfolio optimization failed: {str(e)}", exc_info=True)
+            return {
+                "error": str(e),
+                "tickers": valid_tickers,
+                "status": "error"
+            }
+    
+    def calculate_volatility(self, returns: pd.DataFrame, weights: np.ndarray) -> float:
+        """
+        Calculate portfolio volatility (standard deviation of returns).
+        
+        Args:
+            returns: DataFrame of asset returns
+            weights: Array of asset weights
+            
+        Returns:
+            Portfolio volatility (standard deviation)
+        """
+        try:
+            # Ensure inputs are numpy arrays
+            if isinstance(weights, list):
+                weights = np.array(weights)
+                
+            # Calculate portfolio returns
+            if isinstance(returns, pd.DataFrame):
+                portfolio_returns = returns.values @ weights
+            else:
+                portfolio_returns = returns @ weights
+                
+            # Calculate and return annualized volatility
+            return np.std(portfolio_returns) * np.sqrt(252)  # 252 trading days in a year
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating volatility: {str(e)}")
+            return 0.0
+            
+    def calculate_sharpe_ratio(self, returns: pd.DataFrame, weights: np.ndarray = None) -> float:
+        """
+        Calculate the Sharpe ratio for the given portfolio weights.
+        
+        Args:
+            returns: DataFrame of asset returns
+            weights: Optional array of asset weights. If None, equal weights are used.
+            
+        Returns:
+            float: Annualized Sharpe ratio
+        """
+        try:
+            if weights is None:
+                # Use equal weights if none provided
+                n_assets = returns.shape[1] if hasattr(returns, 'shape') else len(returns.columns)
+                weights = np.ones(n_assets) / n_assets
+            elif isinstance(weights, list):
+                weights = np.array(weights)
+                
+            # Calculate portfolio returns
+            if isinstance(returns, pd.DataFrame):
+                portfolio_returns = returns.values @ weights
+            else:
+                portfolio_returns = returns @ weights
+                
+            # Calculate annualized return and volatility
+            annual_return = np.mean(portfolio_returns) * 252  # 252 trading days in a year
+            annual_vol = np.std(portfolio_returns) * np.sqrt(252)
+            
+            # Avoid division by zero
+            if annual_vol < 1e-10:
+                return 0.0
+                
+            # Calculate Sharpe ratio (annualized)
+            sharpe_ratio = (annual_return - self.risk_free_rate) / annual_vol
+            
+            return sharpe_ratio
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating Sharpe ratio: {str(e)}")
+            return 0.0
+            
+    def calculate_max_drawdown(self, returns: pd.DataFrame, weights: np.ndarray) -> float:
+        """
+        Calculate maximum drawdown of the portfolio.
+        
+        Args:
+            returns: DataFrame of asset returns
+            weights: Array of asset weights
+            
+        Returns:
+            Maximum drawdown as a decimal (e.g., 0.15 for 15%)
+        """
+        try:
+            # Ensure inputs are numpy arrays
+            if isinstance(weights, list):
+                weights = np.array(weights)
+                
+            # Calculate portfolio returns
+            if isinstance(returns, pd.DataFrame):
+                portfolio_returns = returns.values @ weights
+            else:
+                portfolio_returns = returns @ weights
+                
+            # Calculate cumulative returns
+            cum_returns = np.cumprod(1 + portfolio_returns) - 1
+            
+            # Calculate running maximum
+            running_max = np.maximum.accumulate(cum_returns)
+            
+            # Calculate drawdowns
+            drawdowns = (1 + cum_returns) / (1 + running_max) - 1
+            
+            # Return maximum drawdown (as positive number)
+            return abs(np.min(drawdowns))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating max drawdown: {str(e)}")
+            return 0.0
+            
     def _calculate_returns(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate daily returns with robust error handling.
@@ -272,14 +475,14 @@ class PortfolioOptimizer:
         
     def _calculate_portfolio_return(self, weights: np.ndarray, returns: pd.DataFrame) -> float:
         """
-        Calculate portfolio expected return with robust error handling
+        Calculate portfolio expected return with robust error handling and proper scaling.
         
         Args:
             weights: Portfolio weights
-            returns: DataFrame of asset returns or prices
+            returns: DataFrame of asset returns (not prices)
             
         Returns:
-            float: Annualized portfolio return (bounded between -99% and +1000%)
+            float: Annualized portfolio return (bounded between -99% and +100%)
         """
         try:
             if returns.empty:
@@ -289,84 +492,61 @@ class PortfolioOptimizer:
             # Ensure returns is a DataFrame
             if not isinstance(returns, pd.DataFrame):
                 returns = pd.DataFrame(returns)
-                
-            # If input is prices, convert to returns
-            if not np.any(returns < 0):  # Likely prices if all values are positive
-                close_col = self._get_close_column_name(returns)
-                try:
-                    returns = returns[close_col].pct_change().dropna()
-                    if not isinstance(returns, pd.DataFrame):
-                        returns = pd.DataFrame(returns)
-                except Exception as e:
-                    logger.warning(f"Error converting prices to returns: {str(e)}")
-                    return 0.0
+            
+            # Check for potential percentage returns (values > 1)
+            max_return = returns.abs().max().max()
+            if max_return > 1.0:  # Likely percentage returns (e.g., 1.5 for 150%)
+                logger.warning(f"Detected potential percentage returns (max={max_return:.2%}). Converting to decimal.")
+                returns = returns / 100.0
             
             # Handle any remaining NaN or infinite values
             if returns.isnull().any().any() or np.isinf(returns).any().any():
-                logger.warning("Returns data contains NaN or infinite values. Cleaning data...")
+                logger.warning("Cleaning returns data...")
                 returns = returns.replace([np.inf, -np.inf], np.nan)
-                
-                # Forward fill, then backfill any remaining NaNs
-                returns = returns.ffill().bfill()
-                
-                # If still NaN, fill with column means
-                if returns.isnull().any().any():
-                    returns = returns.fillna(0)  # Use 0 instead of mean to avoid bias
-            
-            # If we have a single column, ensure it's a DataFrame with proper column name
-            if isinstance(returns, pd.Series):
-                returns = pd.DataFrame(returns)
-            
-            # Handle case where all returns are zero
-            if returns.abs().sum().sum() < 1e-10:
-                logger.warning("All returns are zero or very close to zero")
-                return 0.0
-            
-            # Calculate mean returns with error handling
-            mean_returns = returns.mean()
-            
-            # Convert to numpy array safely
-            mean_returns_np = mean_returns.to_numpy() if hasattr(mean_returns, 'to_numpy') else np.array(mean_returns)
+                returns = returns.ffill().bfill().fillna(0)
             
             # Ensure weights are in correct format
             weights_1d = np.asarray(weights).squeeze()
             if weights_1d.ndim == 0:
                 weights_1d = np.array([weights_1d.item()])
-                
+            
             # Ensure weights sum to 1 (with small tolerance)
             weight_sum = np.sum(weights_1d)
-            if abs(weight_sum - 1.0) > 0.01:  # Allow 1% tolerance
-                logger.warning(f"Weights sum to {weight_sum:.6f}, normalizing to sum to 1.0")
+            if not np.isclose(weight_sum, 1.0, rtol=1e-3):
+                logger.warning(f"Weights sum to {weight_sum:.6f}, normalizing to 1.0")
                 weights_1d = weights_1d / (weight_sum + 1e-10)
             
             # Ensure dimensions match
-            if len(weights_1d) != len(mean_returns_np):
-                logger.warning(f"Mismatch in dimensions: weights ({len(weights_1d)}) vs returns ({len(mean_returns_np)})")
-                min_len = min(len(weights_1d), len(mean_returns_np))
+            if len(weights_1d) != returns.shape[1]:
+                min_len = min(len(weights_1d), returns.shape[1])
                 if min_len == 0:
                     logger.error("Zero-length arrays encountered")
                     return 0.0
                 weights_1d = weights_1d[:min_len]
-                mean_returns_np = mean_returns_np[:min_len]
+                returns = returns.iloc[:, :min_len]
             
-            # Calculate portfolio return (annualized)
-            portfolio_return = np.sum(weights_1d * mean_returns_np) * 252
+            # Calculate daily portfolio returns
+            daily_returns = (returns * weights_1d).sum(axis=1)
             
-            # Ensure the return is finite and within reasonable bounds
-            if not np.isfinite(portfolio_return):
-                logger.warning(f"Non-finite portfolio return detected. Using zero.")
-                return 0.0
-                
-            # Cap annual returns between -99% and +1000%
-            portfolio_return = np.clip(portfolio_return, -0.99, 10.0)
+            # Calculate mean daily return
+            mean_daily_return = daily_returns.mean()
+            
+            # Annualize returns using compounding
+            # (1 + daily_return)^252 - 1
+            annualized_return = (1 + mean_daily_return) ** 252 - 1
+            
+            # Cap returns at reasonable values
+            annualized_return = np.clip(annualized_return, -0.99, 1.0)  # -99% to +100%
             
             # Log the calculation for debugging
-            logger.debug(f"Portfolio return - "
-                       f"Weights sum: {np.sum(weights_1d):.4f}, "
-                       f"Mean returns: {np.mean(mean_returns_np):.6f}, "
-                       f"Annualized return: {portfolio_return:.6f}")
+            logger.debug(
+                f"Portfolio return - "
+                f"Mean daily return: {mean_daily_return:.6f}, "
+                f"Annualized return: {annualized_return:.6f}, "
+                f"Weights sum: {np.sum(weights_1d):.6f}"
+            )
             
-            return float(portfolio_return)
+            return float(annualized_return)
             
         except Exception as e:
             logger.error(f"Error calculating portfolio return: {str(e)}", exc_info=True)
@@ -510,6 +690,32 @@ class PortfolioOptimizer:
             logger.warning(f"Error calculating diversification ratio: {str(e)}")
             return 1.0
 
+    def _validate_returns(self, returns: pd.DataFrame) -> bool:
+        """Validate returns data before processing.
+        
+        Args:
+            returns: DataFrame of asset returns
+            
+        Returns:
+            bool: True if returns data appears valid
+        """
+        if returns.empty:
+            logger.warning("Empty returns data provided")
+            return False
+            
+        # Check for extreme values that suggest incorrect scaling
+        max_return = returns.abs().max().max()
+        if max_return > 1.0:  # If any return is > 100%
+            logger.warning(f"Extreme return values detected (max={max_return:.2%}). Ensure returns are in decimal format (e.g., 0.01 for 1%).")
+            return False
+            
+        # Check for NaN or infinite values
+        if returns.isnull().any().any() or np.isinf(returns).any().any():
+            logger.warning("Returns data contains NaN or infinite values")
+            return False
+            
+        return True
+        
     def _is_price_data(
         self,
         data: pd.DataFrame
@@ -521,7 +727,7 @@ class PortfolioOptimizer:
 
     def _calculate_metrics_from_returns(self, returns: pd.DataFrame) -> Dict[str, float]:
         """
-        Calculate portfolio metrics from return data.
+        Calculate portfolio metrics from return data with proper validation and scaling.
         
         Args:
             returns: DataFrame of asset returns (columns = assets, index = dates)
@@ -534,11 +740,23 @@ class PortfolioOptimizer:
             'expected_return': 0.0,
             'volatility': 0.0,
             'sharpe_ratio': 0.0,
+            'max_drawdown': 0.0,
             'diversification_ratio': 1.0,
             'warning': None
         }
         
         try:
+            # Validate returns data
+            if not self._validate_returns(returns):
+                # If validation fails, try to fix scaling issues
+                if not returns.empty and np.any(returns.abs() > 1.0):
+                    logger.warning("Attempting to fix returns scaling (dividing by 100)")
+                    returns = returns / 100.0
+                    if not self._validate_returns(returns):
+                        raise ValueError("Returns data failed validation after scaling attempt")
+                else:
+                    raise ValueError("Invalid returns data provided")
+            
             if not hasattr(self, 'portfolio_weights') or not self.portfolio_weights:
                 raise ValueError("Portfolio weights not set")
                 
@@ -550,38 +768,57 @@ class PortfolioOptimizer:
             returns = returns[valid_assets]
             weights = np.array([self.portfolio_weights[a] for a in valid_assets])
             
-            # Ensure weights sum to 1
-            if not np.isclose(weights.sum(), 1.0):
-                weights = weights / weights.sum()
+            # Ensure weights sum to 1 (with small tolerance)
+            weight_sum = weights.sum()
+            if not np.isclose(weight_sum, 1.0, rtol=1e-6):
+                logger.warning(f"Weights sum to {weight_sum:.6f}, normalizing to 1.0")
+                weights = weights / (weight_sum + 1e-10)
             
-            # Calculate covariance matrix (annualized)
-            cov_matrix = returns.cov() * 252  # Annualize the covariance
+            # Calculate daily metrics first
+            daily_returns = returns @ weights
             
-            # Log input data for debugging
-            logger.debug(f"Calculating metrics with {len(returns)} data points")
-            logger.debug(f"Asset weights: {dict(zip(valid_assets, weights))}")
-            logger.debug(f"Mean returns: {returns.mean().to_dict()}")
+            # Calculate max drawdown from daily returns
+            cum_returns = (1 + daily_returns).cumprod()
+            running_max = np.maximum.accumulate(cum_returns)
+            drawdowns = (cum_returns - running_max) / running_max
+            max_drawdown = abs(min(0, drawdowns.min()))  # As positive number
             
-            # Calculate metrics using the same method as in _log_optimization_results
-            port_return = (returns.mean() @ weights) * 252  # Annualized return
-            port_vol = np.sqrt(weights @ cov_matrix.values @ weights.T)  # Annualized volatility
-            sharpe = port_return / (port_vol + 1e-10)  # Avoid division by zero
-            div_ratio = self._calculate_diversification_ratio(weights, cov_matrix)
+            # Calculate covariance matrix (daily)
+            cov_matrix_daily = returns.cov()
             
-            # Log calculated values
+            # Calculate portfolio metrics
+            port_return_daily = daily_returns.mean()
+            port_vol_daily = np.sqrt(weights @ cov_matrix_daily.values @ weights.T)
+            
+            # Annualize metrics
+            port_return_annual = (1 + port_return_daily) ** 252 - 1
+            port_vol_annual = port_vol_daily * np.sqrt(252)
+            
+            # Calculate Sharpe ratio with risk-free rate
+            excess_return = port_return_annual - self.risk_free_rate
+            sharpe = excess_return / (port_vol_annual + 1e-10)  # Avoid division by zero
+            
+            # Calculate diversification ratio
+            div_ratio = self._calculate_diversification_ratio(weights, cov_matrix_daily)
+            
+            # Log calculated values for debugging
             logger.debug(
-                f"Calculated metrics - "
-                f"Return: {port_return:.6f} ({(port_return*100):.2f}%), "
-                f"Vol: {port_vol:.6f} ({(port_vol*100):.2f}%), "
+                f"Portfolio metrics - "
+                f"Daily Return: {port_return_daily:.6f}, "
+                f"Annual Return: {port_return_annual:.6f}, "
+                f"Daily Vol: {port_vol_daily:.6f}, "
+                f"Annual Vol: {port_vol_annual:.6f}, "
                 f"Sharpe: {sharpe:.6f}, "
+                f"MaxDD: {max_drawdown:.6f}, "
                 f"DivRatio: {div_ratio:.6f}"
             )
             
             # Update metrics with calculated values
             metrics.update({
-                'expected_return': float(port_return) * 100,  # Convert to percentage
-                'volatility': float(port_vol) * 100,  # Convert to percentage
+                'expected_return': float(port_return_annual * 100),  # As percentage
+                'volatility': float(port_vol_annual * 100),         # As percentage
                 'sharpe_ratio': float(sharpe),
+                'max_drawdown': float(max_drawdown * 100),          # As percentage
                 'diversification_ratio': float(div_ratio)
             })
             

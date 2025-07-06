@@ -240,11 +240,12 @@ class SentimentAnalyzer:
                 - publishedAt: Publication timestamp
                 - source: Source name
                 - url: Article URL
+                - urlToImage: Article image URL
+                - date: Publication date
                 - sentiment: Sentiment score (0-1)
         """
         # Initialize empty DataFrame to store news with expected columns
-        news_columns = ['title', 'description', 'content', 'publishedAt', 
-                      'source', 'url', 'urlToImage', 'sentiment']
+        news_columns = ['title', 'description', 'content', 'publishedAt', 'source', 'url', 'urlToImage', 'sentiment', 'date']
         news_df = pd.DataFrame(columns=news_columns)
         
         # Validate input
@@ -276,6 +277,11 @@ class SentimentAnalyzer:
                 
             if cached_data is not None and not cached_data.empty:
                 self.logger.info(f"Retrieved {len(cached_data)} cached news articles for {ticker}")
+                # Ensure required columns
+                if 'date' not in cached_data.columns:
+                    cached_data['date'] = pd.to_datetime(cached_data['publishedAt'], errors='coerce').dt.normalize()
+                if 'sentiment' not in cached_data.columns or cached_data['sentiment'].isnull().all():
+                    cached_data['sentiment'] = cached_data['title'].apply(lambda x: self.analyze_text_sentiment(x))
                 return cached_data
         except Exception as cache_error:
             self.logger.warning(f"Error retrieving from cache: {str(cache_error)}")
@@ -358,8 +364,9 @@ class SentimentAnalyzer:
                                     'source': f'r/{sub}',
                                     'url': f"https://reddit.com{post.permalink}",
                                     'urlToImage': '',
-                                    'sentiment': 0.5,  # Will be calculated later
-                                    'data_source': 'reddit'  # Track that this came from Reddit
+                                    'sentiment': self.analyze_text_sentiment(post.title),
+                                    'data_source': 'reddit',
+                                    'date': pd.to_datetime(datetime.utcfromtimestamp(post.created_utc)).normalize()
                                 }
                                 posts.append(post_data)
                                 
@@ -411,7 +418,8 @@ class SentimentAnalyzer:
                         'source': article.get('source', {}).get('name', '').strip(),
                         'url': article['url'].strip(),
                         'urlToImage': article.get('urlToImage', '').strip(),
-                        'sentiment': 0.5  # Will be calculated later
+                        'sentiment': 0.5,  # Will be replaced below
+                        'date': pd.to_datetime(article.get('publishedAt', None), errors='coerce').normalize()
                     }
                     
                     # Skip if the article doesn't mention the ticker or company name
@@ -432,73 +440,23 @@ class SentimentAnalyzer:
             if not processed_articles:
                 self.logger.warning("No relevant articles found after processing")
                 return news_df
-                
-            # Create DataFrame from processed articles
-            news_df = pd.DataFrame(processed_articles)
             
+            news_df = pd.DataFrame(processed_articles)
+            # Compute sentiment for each article
+            news_df['sentiment'] = news_df['title'].apply(lambda x: self.analyze_text_sentiment(x))
+            # Ensure 'date' column exists
+            if 'date' not in news_df.columns:
+                news_df['date'] = pd.to_datetime(news_df['publishedAt'], errors='coerce').dt.normalize()
             # Cache the results for 6 hours (API rate limiting consideration)
             if not news_df.empty:
                 self._set_cached_data(cache_key, news_df.to_dict('records'), ttl=21600)
                 self.logger.info(f"Cached {len(news_df)} news articles for {ticker}")
-            
             return news_df
             
         except Exception as e:
             self.logger.error(f"Error in get_company_news for {ticker}: {str(e)}", exc_info=True)
             return pd.DataFrame()  # Return empty DataFrame on error
             
-    def analyze_news_sentiment(self, news_df):
-        """
-        Analyze sentiment of news articles using VADER
-        """
-        if news_df.empty:
-            self.logger.warning("No news data to analyze")
-            return {
-                'avg_sentiment': 0.5,
-                'positive_news': 0,
-                'negative_news': 0,
-                'total_news': 0
-            }
-            
-        def get_sentiment(text):
-            if not text or not isinstance(text, str):
-                return 0.5
-            scores = self.sia.polarity_scores(text)
-            # Normalize compound score from [-1, 1] to [0, 1]
-            return (scores['compound'] + 1) / 2
-            
-        try:
-            # Analyze both title and snippet
-            news_df['title_sentiment'] = news_df['title'].apply(get_sentiment)
-            news_df['snippet_sentiment'] = news_df['snippet'].apply(get_sentiment)
-            
-            # Weight title more than snippet
-            news_df['sentiment'] = (news_df['title_sentiment'] * 0.7 + 
-                                 news_df['snippet_sentiment'] * 0.3)
-            
-            # Calculate overall sentiment score
-            news_sentiment = {
-                'avg_sentiment': float(news_df['sentiment'].mean()),
-                'positive_news': int(len(news_df[news_df['sentiment'] > 0.6])),
-                'negative_news': int(len(news_df[news_df['sentiment'] < 0.4])),
-                'total_news': int(len(news_df))
-            }
-            
-            self.logger.info(f"Analyzed {news_sentiment['total_news']} news articles. "
-                          f"Positive: {news_sentiment['positive_news']}, "
-                          f"Negative: {news_sentiment['negative_news']}")
-            
-            return news_sentiment
-            
-        except Exception as e:
-            self.logger.error(f"Error analyzing news sentiment: {str(e)}")
-            return {
-                'avg_sentiment': 0.5,
-                'positive_news': 0,
-                'negative_news': 0,
-                'total_news': 0
-            }
-        
     def get_market_news(self, days=1):
         """
         Get general market news that might affect stock sentiment
@@ -509,7 +467,18 @@ class SentimentAnalyzer:
         cached_data = self._get_cached_data(cache_key)
         if cached_data:
             self.logger.info(f"Retrieved {len(cached_data)} market news articles from cache")
-            return pd.DataFrame(cached_data)
+            df = pd.DataFrame(cached_data)
+            # Robustly ensure all required columns exist and are correct
+            if 'date' not in df.columns:
+                if 'publishedAt' in df.columns:
+                    df['date'] = pd.to_datetime(df['publishedAt'], errors='coerce').dt.normalize()
+                else:
+                    df['date'] = pd.NaT
+            if 'sentiment' not in df.columns or df['sentiment'].isnull().all():
+                df['sentiment'] = df['title'].apply(lambda x: self.analyze_text_sentiment(x))
+            # Remove any duplicate or conflicting columns
+            df = df.loc[:,~df.columns.duplicated()]
+            return df
             
         if not self.newsapi:
             self.logger.error("NewsAPI client not initialized")
@@ -519,8 +488,6 @@ class SentimentAnalyzer:
             # Calculate date range
             to_date = datetime.now()
             from_date = to_date - timedelta(days=days)
-            
-            # Fetch market news
             response = self.newsapi.get_everything(
                 q='market OR economy OR stocks OR federal reserve OR interest rates',
                 from_param=from_date.strftime('%Y-%m-%d'),
@@ -531,25 +498,30 @@ class SentimentAnalyzer:
                 sources='bloomberg,reuters,cnbc,financial-post,wall-street-journal',
                 domains='bloomberg.com,reuters.com,cnbc.com,wsj.com,ft.com'
             )
-            
-            # Process articles
             articles = []
-            for article in response.get('articles', [])[:10]:  # Limit to 10 articles
+            for article in response.get('articles', [])[:10]:
+                title = article.get('title', '')
+                snippet = article.get('description', '')
+                published_at = article.get('publishedAt', datetime.now().strftime('%Y-%m-%d'))
+                sentiment = self.analyze_text_sentiment(title)
                 articles.append({
-                    'title': article.get('title', ''),
-                    'snippet': article.get('description', ''),
+                    'title': title,
+                    'snippet': snippet,
                     'source': article.get('source', {}).get('name', ''),
-                    'date': article.get('publishedAt', datetime.now().strftime('%Y-%m-%d')),
-                    'url': article.get('url', '')
+                    'date': pd.to_datetime(published_at, errors='coerce').normalize(),
+                    'url': article.get('url', ''),
+                    'sentiment': sentiment
                 })
-            
-            # Cache the results
             if articles:
                 self._set_cached_data(cache_key, articles)
-            
             self.logger.info(f"Fetched {len(articles)} market news articles")
-            return pd.DataFrame(articles)
-            
+            df = pd.DataFrame(articles)
+            # Ensure all required columns exist
+            if 'date' not in df.columns:
+                df['date'] = pd.to_datetime(df['publishedAt'], errors='coerce').dt.normalize()
+            if 'sentiment' not in df.columns or df['sentiment'].isnull().all():
+                df['sentiment'] = df['title'].apply(lambda x: self.analyze_text_sentiment(x))
+            return df
         except Exception as e:
             self.logger.error(f"Error fetching market news: {str(e)}", exc_info=True)
             return pd.DataFrame()
@@ -966,15 +938,26 @@ class SentimentAnalyzer:
             self.logger.info(f"Using cached sentiment data for {ticker}")
             return cached_data
         
+        # Initialize sentiment_sources_status dict to track data source status
+        sentiment_sources_status = {}
+        sentiment_data = {}
+        
+        def ensure_column_exists(df: pd.DataFrame, col: str, context: str) -> bool:
+            """
+            Utility to check if a column exists in a DataFrame and log an error if missing.
+            Returns True if the column exists, False otherwise.
+            """
+            if col not in df.columns:
+                self.logger.error(f"Missing column '{col}' in {context}. Columns present: {df.columns.tolist()}")
+                return False
+            return True
+
         try:
             # Generate a date range for the requested period
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
             date_range = pd.date_range(start=start_date, end=end_date, freq='D')
             self.logger.info(f"Generated date range from {start_date} to {end_date} with {len(date_range)} days")
-            
-            # Initialize DataFrame with date index
-            sentiment_df = pd.DataFrame(index=date_range)
             
             # Initialize default values
             default_features = {
@@ -995,296 +978,247 @@ class SentimentAnalyzer:
                 'reddit_mention_count': 0,
                 'reddit_avg_comments': 0.0,
                 'reddit_avg_score': 0.0,
-                'combined_sentiment': 0.5
+                'combined_sentiment': 0.5,
+                'sentiment_score': 0.5,
+                'Sentiment': 0.5,  # For backward compatibility
+                'Price_Momentum': 0.5,
+                'Volume_Change': 0.5,
+                'Volatility': 0.3,
+                'data_source': 'fallback',
+                'sentiment': 0.5  # For backward compatibility
             }
             
-            # Dictionary to store sentiment data for each source
-            sentiment_data = {}
-            news_available = False
+            # Initialize the main DataFrame with date index and default values
+            sentiment_df = pd.DataFrame(index=date_range)
+            for col, val in default_features.items():
+                sentiment_df[col] = val
+                
+            # Add date column for merging
+            sentiment_df['date'] = sentiment_df.index.normalize()
             
+            # Track which data sources were successfully processed
+            processed_sources = set()
+            
+            # Get price metrics (always available)
+            try:
+                price_metrics = self.get_price_metrics(ticker, days=min(days * 2, 365))  # Get up to 1 year of data
+                if price_metrics and isinstance(price_metrics, dict):
+                    sentiment_df['price_momentum'] = price_metrics.get('price_momentum', 0.5)
+                    sentiment_df['volume_change'] = price_metrics.get('volume_change', 0.5)
+                    sentiment_df['volatility'] = price_metrics.get('volatility', 0.3)
+                    # Set capitalized versions for backward compatibility
+                    sentiment_df['Price_Momentum'] = sentiment_df['price_momentum']
+                    sentiment_df['Volume_Change'] = sentiment_df['volume_change']
+                    sentiment_df['Volatility'] = sentiment_df['volatility']
+                    processed_sources.add('price_metrics')
+                    self.logger.info("Successfully processed price metrics")
+            except Exception as e:
+                self.logger.error(f"Error processing price metrics: {str(e)}", exc_info=True)
+                
             # Get company news sentiment
             try:
-                news_df = self.get_company_news(ticker, days=days)
-                if not news_df.empty:
-                    # Process news data by date
-                    news_df['publishedAt'] = pd.to_datetime(news_df['publishedAt'])
-                    news_df = news_df.set_index('publishedAt')
+                company_news = self.get_company_news(ticker, days=min(days, 30))  # Limit to 30 days for API rate limits
+                if not company_news.empty and 'date' in company_news.columns and 'sentiment' in company_news.columns:
+                    # Process company news
+                    company_news['date'] = pd.to_datetime(company_news['date']).dt.normalize()
+                    company_news = company_news[company_news['date'].between(start_date, end_date)]
                     
-                    # Group by date and calculate daily sentiment
-                    daily_news = news_df.groupby(pd.Grouper(freq='D')).agg({
-                        'sentiment': 'mean',
-                        'title': 'count'  # Count articles per day
-                    }).rename(columns={'title': 'news_count'})
-                    
-                    # Add to sentiment data
-                    sentiment_data['news_sentiment'] = daily_news['sentiment']
-                    sentiment_data['news_volume'] = daily_news['news_count']
-                    news_available = True
-                    self.logger.info(f"Successfully analyzed {news_df.shape[0]} news articles for {ticker}")
-                else:
-                    self.logger.warning(f"No news articles found for {ticker}")
+                    if not company_news.empty:
+                        # Calculate daily sentiment and volume
+                        daily_news = company_news.groupby('date').agg({
+                            'sentiment': 'mean',
+                            'title': 'count'
+                        }).rename(columns={'title': 'news_count'}).reindex(date_range, fill_value=0)
+                        
+                        # Update sentiment and volume
+                        sentiment_df['news_sentiment'] = daily_news['sentiment'].fillna(0.5)
+                        sentiment_df['news_volume'] = daily_news['news_count'].fillna(0)
+                        processed_sources.add('company_news')
+                        self.logger.info(f"Processed {len(company_news)} company news articles")
             except Exception as e:
-                self.logger.error(f"Error in company news analysis: {str(e)}", exc_info=True)
-            
-            # If no news available, increase Reddit weight in combined sentiment
-            use_reddit_fallback = not news_available
-            if use_reddit_fallback:
-                self.logger.info(f"Using Reddit sentiment as fallback for {ticker}")
-            
+                self.logger.error(f"Error processing company news: {str(e)}", exc_info=True)
+                
             # Get market news sentiment
             try:
-                market_news = self.get_market_news()
-                if not market_news.empty:
-                    self.logger.info(f"Market news columns: {market_news.columns.tolist()}")
+                market_news = self.get_market_news(days=min(days, 7))  # Limit to 7 days for API rate limits
+                if not market_news.empty and 'date' in market_news.columns and 'sentiment' in market_news.columns:
+                    # Process market news
+                    market_news['date'] = pd.to_datetime(market_news['date']).dt.normalize()
+                    market_news = market_news[market_news['date'].between(start_date, end_date)]
                     
-                    # Check if we have the necessary columns
-                    if 'date' not in market_news.columns:
-                        self.logger.warning("Market news data missing 'date' column. Using fallback.")
-                        # Create a fallback date column with today's date
-                        market_news['date'] = datetime.now().strftime('%Y-%m-%d')
-                    
-                    # Convert date column to datetime
-                    market_news['date'] = pd.to_datetime(market_news['date'])
-                    market_news = market_news.set_index('date')
-                    
-                    # Add sentiment analysis to market news if needed
-                    if 'title' in market_news.columns and 'sentiment' not in market_news.columns:
-                        self.logger.info("Adding sentiment analysis to market news")
-                        market_news['sentiment'] = market_news['title'].apply(lambda x: self.analyze_text_sentiment(x) if isinstance(x, str) else 0.0)
-                    
-                    # Ensure we have a sentiment column
-                    if 'sentiment' not in market_news.columns:
-                        self.logger.warning("Market news missing sentiment column. Using fallback.")
-                        market_news['sentiment'] = 0.5  # Neutral sentiment
-                    
-                    # Ensure we have a title column for counting
-                    if 'title' not in market_news.columns:
-                        self.logger.warning("Market news missing title column. Using fallback.")
-                        market_news['title'] = 'Fallback title'
-                    
-                    # Group by date and calculate daily sentiment
-                    try:
-                        daily_market = market_news.groupby(pd.Grouper(freq='D')).agg({
+                    if not market_news.empty:
+                        # Calculate daily sentiment and volume
+                        daily_market = market_news.groupby('date').agg({
                             'sentiment': 'mean',
-                            'title': 'count'  # Count articles per day
-                        }).rename(columns={'title': 'market_news_count'})
+                            'title': 'count'
+                        }).rename(columns={'title': 'market_news_count'}).reindex(date_range, fill_value=0)
                         
-                        # Add to sentiment data
-                        sentiment_data['market_news_sentiment'] = daily_market['sentiment']
-                        sentiment_data['market_news_volume'] = daily_market['market_news_count']
-                        self.logger.info(f"Successfully processed market news with {len(daily_market)} daily entries")
-                    except Exception as e:
-                        self.logger.error(f"Error grouping market news: {str(e)}")
-                        # Create fallback market sentiment data
-                        sentiment_data['market_news_sentiment'] = pd.Series(0.5, index=date_range)  # Neutral
-                        sentiment_data['market_news_volume'] = pd.Series(0, index=date_range)  # Zero volume
-                else:
-                    self.logger.warning("Empty market news data. Using fallback.")
-                    # Create fallback market sentiment data
-                    sentiment_data['market_news_sentiment'] = pd.Series(0.5, index=date_range)  # Neutral
-                    sentiment_data['market_news_volume'] = pd.Series(0, index=date_range)  # Zero volume
+                        # Update sentiment and volume
+                        sentiment_df['market_news_sentiment'] = daily_market['sentiment'].fillna(0.5)
+                        sentiment_df['market_news_volume'] = daily_market['market_news_count'].fillna(0)
+                        processed_sources.add('market_news')
+                        self.logger.info(f"Processed {len(market_news)} market news articles")
             except Exception as e:
-                self.logger.error(f"Error in market news analysis: {str(e)}", exc_info=True)
-            
+                self.logger.error(f"Error processing market news: {str(e)}", exc_info=True)
+                
             # Get Reddit sentiment
             try:
                 reddit_sentiment = self.analyze_reddit_sentiment(ticker)
-                
-                # Validate Reddit sentiment data
                 if reddit_sentiment and isinstance(reddit_sentiment, dict):
-                    self.logger.info(f"Retrieved Reddit sentiment for {ticker}: {reddit_sentiment}")
+                    for key, value in reddit_sentiment.items():
+                        if key in sentiment_df.columns:
+                            sentiment_df[key] = float(value) if value is not None else 0.0
+                    processed_sources.add('reddit')
+                    self.logger.info("Processed Reddit sentiment data")
+            except Exception as e:
+                self.logger.error(f"Error processing Reddit sentiment: {str(e)}", exc_info=True)
+            
+            # Calculate combined sentiment score (weighted average of available sources)
+            try:
+                sentiment_cols = ['news_sentiment', 'market_news_sentiment', 'reddit_compound']
+                available_cols = [col for col in sentiment_cols if col in sentiment_df.columns]
+                
+                if available_cols:
+                    # Simple average of available sentiment scores
+                    sentiment_df['combined_sentiment'] = sentiment_df[available_cols].mean(axis=1).clip(0, 1)
+                    sentiment_df['sentiment_score'] = sentiment_df['combined_sentiment']
+                    sentiment_df['Sentiment'] = sentiment_df['combined_sentiment']  # For backward compatibility
+                    sentiment_df['sentiment'] = sentiment_df['combined_sentiment']  # For backward compatibility
                     
-                    # Create a series with constant values for the date range
+                    # Update data source based on available sources
+                    if processed_sources:
+                        sentiment_df['data_source'] = ','.join(sorted(processed_sources))
+            except Exception as e:
+                self.logger.error(f"Error calculating combined sentiment: {str(e)}", exc_info=True)
+            
+            # Ensure all required columns exist and have proper types
+            for col in ['sentiment', 'Sentiment', 'sentiment_score', 'combined_sentiment',
+                       'Price_Momentum', 'Volume_Change', 'Volatility']:
+                if col in sentiment_df.columns:
+                    sentiment_df[col] = pd.to_numeric(sentiment_df[col], errors='coerce').fillna(0.5)
+            
+            # Set index to date and sort
+            sentiment_df = sentiment_df.set_index('date').sort_index()
+            
+            # Cache the results for 1 hour
+            self._set_cached_data(cache_key, sentiment_df, ttl=3600)
+            
+            self.logger.info(f"Successfully created sentiment features with data from: {', '.join(processed_sources) if processed_sources else 'no sources'}")
+            return sentiment_df
+            
+        except Exception as e:
+            self.logger.error(f"Error in create_sentiment_features: {str(e)}", exc_info=True)
+            
+            # Create a fallback DataFrame with default values
+            fallback_df = pd.DataFrame(index=date_range)
+            for col, val in default_features.items():
+                fallback_df[col] = val
+            fallback_df['data_source'] = 'error_fallback'
+            fallback_df = fallback_df.set_index('date') if 'date' in fallback_df.columns else fallback_df
+            
+            # Handle Reddit sentiment data
+            try:
+                if reddit_sentiment and isinstance(reddit_sentiment, dict):
                     for key, value in reddit_sentiment.items():
                         try:
-                            # Convert to float and handle potential conversion errors
                             float_value = float(value) if value is not None else 0.0
-                            sentiment_data[key] = pd.Series(float_value, index=date_range)
+                            fallback_df[key] = float_value
                         except (ValueError, TypeError) as e:
                             self.logger.warning(f"Error converting Reddit sentiment value '{value}' to float: {str(e)}")
-                            # Use fallback value
-                            sentiment_data[key] = pd.Series(0.0, index=date_range)
+                            fallback_df[key] = 0.0
                 else:
                     self.logger.warning(f"Invalid Reddit sentiment data for {ticker}. Using fallback.")
-                    # Use fallback values for Reddit sentiment
                     reddit_keys = ['reddit_compound', 'reddit_positive', 'reddit_negative', 'reddit_neutral', 
-                                  'reddit_mention_count', 'reddit_avg_comments', 'reddit_avg_score']
+                                'reddit_mention_count', 'reddit_avg_comments', 'reddit_avg_score']
                     for key in reddit_keys:
-                        default_value = 0.0 if key != 'reddit_neutral' else 1.0  # Neutral sentiment as fallback
-                        sentiment_data[key] = pd.Series(default_value, index=date_range)
+                        default_value = 0.0 if key != 'reddit_neutral' else 1.0
+                        fallback_df[key] = default_value
             except Exception as e:
                 self.logger.error(f"Error in Reddit sentiment analysis: {str(e)}", exc_info=True)
-                # Use fallback values for Reddit sentiment
                 reddit_keys = ['reddit_compound', 'reddit_positive', 'reddit_negative', 'reddit_neutral', 
-                              'reddit_mention_count', 'reddit_avg_comments', 'reddit_avg_score']
+                            'reddit_mention_count', 'reddit_avg_comments', 'reddit_avg_score']
                 for key in reddit_keys:
-                    default_value = 0.0 if key != 'reddit_neutral' else 1.0  # Neutral sentiment as fallback
-                    sentiment_data[key] = pd.Series(default_value, index=date_range)
+                    default_value = 0.0 if key != 'reddit_neutral' else 1.0
+                    fallback_df[key] = default_value
             
-            # Get macroeconomic sentiment
-            try:
-                macro_sentiment = self.get_macro_sentiment()
-                
-                # Validate macro sentiment data
-                if macro_sentiment and isinstance(macro_sentiment, dict):
-                    self.logger.info(f"Retrieved macroeconomic sentiment: {macro_sentiment}")
-                    
-                    # Create series with constant values for the date range
-                    for key, value in macro_sentiment.items():
-                        try:
-                            # Convert to float and handle potential conversion errors
-                            float_value = float(value) if value is not None else 0.5  # Default to neutral
-                            sentiment_data[key] = pd.Series(float_value, index=date_range)
-                        except (ValueError, TypeError) as e:
-                            self.logger.warning(f"Error converting macro sentiment value '{value}' to float: {str(e)}")
-                            # Use fallback value
-                            sentiment_data[key] = pd.Series(0.5, index=date_range)  # Neutral sentiment
-                else:
-                    self.logger.warning("Invalid macroeconomic sentiment data. Using fallback.")
-                    # Use fallback values for macro sentiment
-                    macro_keys = ['economic_confidence', 'market_mood', 'risk_sentiment']
-                    default_values = {'economic_confidence': 0.7, 'market_mood': 0.65, 'risk_sentiment': 0.35}
-                    for key in macro_keys:
-                        sentiment_data[key] = pd.Series(default_values.get(key, 0.5), index=date_range)
-            except Exception as e:
-                self.logger.error(f"Error getting macroeconomic sentiment: {str(e)}", exc_info=True)
-                # Use fallback values for macro sentiment
+            return fallback_df
+        
+        # Get macroeconomic sentiment
+        try:
+            macro_sentiment = self.get_macro_sentiment()
+            if macro_sentiment and isinstance(macro_sentiment, dict):
+                sentiment_sources_status['macro'] = 'present'
+            else:
+                sentiment_sources_status['macro'] = 'missing'
+            # (Original logic unchanged)
+            if macro_sentiment and isinstance(macro_sentiment, dict):
+                self.logger.info(f"Retrieved macroeconomic sentiment: {macro_sentiment}")
+                for key, value in macro_sentiment.items():
+                    try:
+                        float_value = float(value) if value is not None else 0.5
+                        sentiment_data[key] = pd.Series(float_value, index=date_range)
+                    except (ValueError, TypeError) as e:
+                        self.logger.warning(f"Error converting macro sentiment value '{value}' to float: {str(e)}")
+                        sentiment_data[key] = pd.Series(0.5, index=date_range)
+            else:
+                self.logger.warning("Invalid macroeconomic sentiment data. Using fallback.")
                 macro_keys = ['economic_confidence', 'market_mood', 'risk_sentiment']
                 default_values = {'economic_confidence': 0.7, 'market_mood': 0.65, 'risk_sentiment': 0.35}
                 for key in macro_keys:
                     sentiment_data[key] = pd.Series(default_values.get(key, 0.5), index=date_range)
-            
-            # Get price-based metrics
-            try:
-                # Get historical price data
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=days*2)  # Get extra data for calculations
-                
-                self.logger.info(f"Downloading price data for {ticker} from {start_date} to {end_date}")
-                
-                # Download data using yfinance with error handling
-                try:
-                    stock_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                    self.logger.info(f"Downloaded {len(stock_data)} price records for {ticker}")
-                except Exception as e:
-                    self.logger.error(f"Error downloading price data for {ticker}: {str(e)}")
-                    stock_data = pd.DataFrame()
-                
-                if not stock_data.empty and len(stock_data) > 5:  # Ensure we have enough data
-                    try:
-                        # Calculate daily price metrics
-                        stock_data['Returns'] = stock_data['Close'].pct_change()
-                        stock_data['MA5'] = stock_data['Close'].rolling(window=5).mean()
-                        stock_data['MA20'] = stock_data['Close'].rolling(window=20).mean()
-                        
-                        # Calculate momentum (MA5/MA20 - 1)
-                        stock_data['Momentum'] = (stock_data['MA5'] / stock_data['MA20'] - 1).fillna(0)
-                        # Scale to 0-1 range
-                        stock_data['Price_Momentum'] = 0.5 + (stock_data['Momentum'] * 5).clip(-0.5, 0.5)
-                        
-                        # Calculate volume change
-                        stock_data['Vol_Change'] = stock_data['Volume'].pct_change(5).fillna(0)
-                        # Scale to 0-1 range
-                        stock_data['Volume_Change'] = 0.5 + (stock_data['Vol_Change'] * 2).clip(-0.5, 0.5)
-                        
-                        # Calculate volatility (20-day rolling std of returns)
-                        stock_data['Volatility'] = stock_data['Returns'].rolling(window=20).std().fillna(0) * np.sqrt(252) * 0.5
-                        stock_data['Volatility'] = stock_data['Volatility'].clip(0, 1)
-                        
-                        # Add to sentiment data
-                        sentiment_data['price_momentum'] = stock_data['Price_Momentum']
-                        sentiment_data['volume_change'] = stock_data['Volume_Change']
-                        sentiment_data['volatility'] = stock_data['Volatility']
-                        
-                        self.logger.info(f"Successfully calculated price metrics for {ticker}")
-                    except Exception as e:
-                        self.logger.error(f"Error calculating price metrics: {str(e)}")
-                        # Use fallback values
-                        self._add_fallback_price_metrics(sentiment_data, date_range)
-                else:
-                    self.logger.warning(f"Insufficient price data for {ticker}. Using fallback values.")
-                    # Use fallback values
-                    self._add_fallback_price_metrics(sentiment_data, date_range)
-            except Exception as e:
-                self.logger.error(f"Error calculating price metrics: {str(e)}", exc_info=True)
-                # Use fallback values
-                self._add_fallback_price_metrics(sentiment_data, date_range)
-            
-            # Create the sentiment DataFrame
-            for key, series in sentiment_data.items():
-                sentiment_df[key] = series
-                
-            # Fill missing values with defaults
-            for key, default_value in default_features.items():
-                if key not in sentiment_df.columns:
-                    sentiment_df[key] = default_value
-                else:
-                    sentiment_df[key] = sentiment_df[key].fillna(default_value)
-            
-            # Calculate combined sentiment score (weighted average)
-            if use_reddit_fallback:
-                # Increase weight on Reddit and market data when news is unavailable
-                combined_weights = {
-                    'news_sentiment': 0.0,            # No company-specific news
-                    'market_news_sentiment': 0.2,     # Increased weight on market news
-                    'market_mood': 0.2,               # Increased weight on macro indicators
-                    'economic_confidence': 0.15,      # Increased weight on macro confidence
-                    'risk_sentiment': 0.15,           # Increased weight on risk indicators
-                    'reddit_compound': 0.25,          # Increased weight on social media
-                    'price_momentum': 0.15            # Increased weight on price action
-                }
-                self.logger.info("Using adjusted weights for Reddit fallback sentiment analysis")
-            else:
-                # Standard weights when news is available
-                combined_weights = {
-                    'news_sentiment': 0.2,            # Company-specific news
-                    'market_news_sentiment': 0.15,    # General market news
-                    'market_mood': 0.15,             # Macro indicators
-                    'economic_confidence': 0.1,       # Macro confidence
-                    'risk_sentiment': 0.1,           # Risk indicators
-                    'reddit_compound': 0.2,          # Social media sentiment
-                    'price_momentum': 0.1            # Market reaction
-                }
-            
-            # Calculate combined sentiment for each day
-            combined_sentiment = pd.Series(0.0, index=sentiment_df.index)
-            for feature, weight in combined_weights.items():
-                if feature in sentiment_df.columns:
-                    combined_sentiment += sentiment_df[feature] * weight
-            
-            sentiment_df['combined_sentiment'] = combined_sentiment
-            
-            # Add sentiment_score column for compatibility
-            sentiment_df['sentiment_score'] = sentiment_df['combined_sentiment']
-            
-            # Add data source column
-            sentiment_df['data_source'] = 'analyzer'
-            
-            # Add capitalized column names for compatibility with app expectations
-            sentiment_df['Sentiment'] = sentiment_df['sentiment_score']
-            sentiment_df['Price_Momentum'] = sentiment_df['price_momentum']
-            sentiment_df['Volume_Change'] = sentiment_df['volume_change']
-            sentiment_df['Volatility'] = sentiment_df['volatility']
-            
-            # Log the results
-            self.logger.info(f"Created sentiment DataFrame for {ticker} with shape {sentiment_df.shape}")
-            
-            # Cache the results
-            self._set_cached_data(cache_key, sentiment_df, ttl=3600)  # Cache for 1 hour
-            
-            return sentiment_df
-            
         except Exception as e:
-            self.logger.error(f"Error creating sentiment features for {ticker}: {str(e)}", exc_info=True)
-            
-            # Create a fallback DataFrame with a date range and default values
+            sentiment_sources_status['macro'] = 'error'
+            self.logger.error(f"Error getting macroeconomic sentiment: {str(e)}", exc_info=True)
+            macro_keys = ['economic_confidence', 'market_mood', 'risk_sentiment']
+            default_values = {'economic_confidence': 0.7, 'market_mood': 0.65, 'risk_sentiment': 0.35}
+            for key in macro_keys:
+                sentiment_data[key] = pd.Series(default_values.get(key, 0.5), index=date_range)
+        
+        # Get price-based metrics
+        try:
             end_date = datetime.now()
+            start_date = end_date - timedelta(days=days*2)
+            self.logger.info(f"Downloading price data for {ticker} from {start_date} to {end_date}")
+            try:
+                stock_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                self.logger.info(f"Downloaded {len(stock_data)} price records for {ticker}")
+            except Exception as e:
+                self.logger.error(f"Error downloading price data for {ticker}: {str(e)}")
+                stock_data = pd.DataFrame()
+            if not stock_data.empty and len(stock_data) > 5:
+                sentiment_sources_status['price_metrics'] = 'present'
+                try:
+                    stock_data['Returns'] = stock_data['Close'].pct_change()
+                    stock_data['MA5'] = stock_data['Close'].rolling(window=5).mean()
+                    stock_data['MA20'] = stock_data['Close'].rolling(window=20).mean()
+                    stock_data['Momentum'] = (stock_data['MA5'] / stock_data['MA20'] - 1).fillna(0)
+                    stock_data['Price_Momentum'] = 0.5 + (stock_data['Momentum'] * 5).clip(-0.5, 0.5)
+                    stock_data['Vol_Change'] = stock_data['Volume'].pct_change(5).fillna(0)
+                    stock_data['Volume_Change'] = 0.5 + (stock_data['Vol_Change'] * 2).clip(-0.5, 0.5)
+                    stock_data['Volatility'] = stock_data['Returns'].rolling(window=20).std().fillna(0) * np.sqrt(252) * 0.5
+                    stock_data['Volatility'] = stock_data['Volatility'].clip(0, 1)
+                    sentiment_data['price_momentum'] = stock_data['Price_Momentum']
+                    sentiment_data['volume_change'] = stock_data['Volume_Change']
+                    sentiment_data['volatility'] = stock_data['Volatility']
+                    self.logger.info(f"Successfully calculated price metrics for {ticker}")
+                except Exception as e:
+                    sentiment_sources_status['price_metrics'] = 'error'
+                    self.logger.error(f"Error calculating price metrics for {ticker}: {str(e)}")
+                    self._add_fallback_price_metrics(sentiment_data, date_range)
+            else:
+                sentiment_sources_status['price_metrics'] = 'missing'
+                self.logger.warning(f"Insufficient price data for {ticker}. Using fallback values.")
+                self._add_fallback_price_metrics(sentiment_data, date_range)
+        except Exception as e:
+            sentiment_sources_status['price_metrics'] = 'error'
+            self.logger.error(f"Error calculating price metrics: {str(e)}", exc_info=True)
+            self._add_fallback_price_metrics(sentiment_data, date_range)
             start_date = end_date - timedelta(days=days)
             date_range = pd.date_range(start=start_date, end=end_date, freq='D')
             
             # Create fallback sentiment data
             fallback_df = pd.DataFrame(index=date_range)
-            
+            fallback_df['date'] = fallback_df.index
             # Add default sentiment columns
             default_features = {
                 'news_sentiment': 0.5,
@@ -1313,11 +1247,12 @@ class SentimentAnalyzer:
                 'Volume_Change': 0.5,
                 'Volatility': 0.3
             }
-            
             # Fill the DataFrame with default values
             for col, val in default_features.items():
                 fallback_df[col] = val
-            self.logger.warning(f"Returning fallback sentiment data for {ticker} due to error")
+            if 'sentiment' not in fallback_df.columns:
+                fallback_df['sentiment'] = 0.5
+            self.logger.warning(f"Returning fallback sentiment data for {ticker} due to error (guaranteed structure)")
             return fallback_df
 
 if __name__ == "__main__":

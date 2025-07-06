@@ -1,15 +1,16 @@
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, TimeDistributed, Attention, Bidirectional, Conv1D, MaxPooling1D, Flatten, BatchNormalization
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler, ModelCheckpoint, ReduceLROnPlateau
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 import os
 import tensorflow as tf
 from tensorflow.keras.regularizers import l2
-from tensorflow.keras.layers.experimental.preprocessing import Normalization
+from tensorflow.keras.layers import Normalization
 
 class LSTMModel:
     def __init__(self, sequence_length=60, features=6):
@@ -21,9 +22,17 @@ class LSTMModel:
         self.model_path = "models/lstm_model.keras"
         self.checkpoint_path = "models/checkpoints/weights.{epoch:02d}-{val_loss:.2f}.keras"
         
-    def build_model(self, units=64, dropout=0.3, learning_rate=0.001, conv_filters=32, kernel_size=3):
+    def build_model(self, units=64, dropout=0.3, learning_rate=0.001, conv_filters=32, kernel_size=3, attention_units=32):
         """
         Build advanced LSTM model with Conv1D, batch normalization, and improved attention
+        
+        Args:
+            units: Number of LSTM units
+            dropout: Dropout rate
+            learning_rate: Initial learning rate
+            conv_filters: Number of filters in Conv1D layer
+            kernel_size: Size of the convolution window
+            attention_units: Number of units in attention layer
         """
         # Input layer
         inputs = Input(shape=(self.sequence_length, self.features))
@@ -53,6 +62,7 @@ class LSTMModel:
         x = Dropout(dropout)(x)
         
         # Improved attention mechanism
+        attention_units = min(units * 2, 128)  # Ensure attention_units is reasonable
         attention = TimeDistributed(Dense(attention_units, activation='tanh'))(x)
         attention = TimeDistributed(Dense(1, activation='relu'))(attention)
         attention = tf.squeeze(attention, axis=-1)
@@ -93,9 +103,21 @@ class LSTMModel:
             metrics=['mae', tf.keras.metrics.RootMeanSquaredError()]
         )
 
-    def train(self, X_train, y_train, epochs=50, batch_size=32, validation_split=0.2):
+    def train(self, x_train, y_train, validation_data=None, epochs=10, batch_size=32, validation_split=0.2, verbose=1):
         """
         Train the LSTM model with advanced training techniques
+        
+        Args:
+            x_train: Training data (numpy array or tuple of numpy arrays)
+            y_train: Training labels
+            validation_data: Tuple of (X_val, y_val) for validation
+            epochs: Number of training epochs
+            batch_size: Batch size for training
+            validation_split: Fraction of training data to use for validation if validation_data is None
+            verbose: Verbosity mode (0 = silent, 1 = progress bar, 2 = one line per epoch)
+            
+        Returns:
+            Dictionary containing training history and metrics
         """
         if self.model is None:
             self.build_model()
@@ -105,65 +127,102 @@ class LSTMModel:
         os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
 
         # Enhanced callbacks
-        early_stopping = EarlyStopping(
-            monitor='val_loss',
-            patience=15,  # Increased patience
-            min_delta=0.0001,  # Minimum change to qualify as improvement
-            restore_best_weights=True,
-            verbose=1
-        )
-        
-        # Model checkpoint with improved naming
-        checkpoint = ModelCheckpoint(
-            self.checkpoint_path,
-            monitor='val_loss',
-            save_best_only=True,
-            save_weights_only=True,
-            mode='min',
-            verbose=1
-        )
-        
-        # Reduce learning rate on plateau
-        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-6,
-            verbose=1
-        )
-        
-        callbacks = [early_stopping, checkpoint, self.lr_scheduler, reduce_lr]
+        callbacks = [
+            EarlyStopping(
+                monitor='val_loss',
+                patience=15,  # Increased patience
+                min_delta=0.0001,  # Minimum change to qualify as improvement
+                restore_best_weights=True,
+                verbose=verbose
+            ),
+            ModelCheckpoint(
+                self.checkpoint_path,
+                monitor='val_loss',
+                save_best_only=True,
+                save_weights_only=True,
+                mode='min',
+                verbose=verbose
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6,
+                verbose=verbose
+            ),
+            self.lr_scheduler
+        ]
 
-        checkpoint = ModelCheckpoint(
-            self.checkpoint_path,
-            monitor='val_loss',
-            save_best_only=True,
-            save_weights_only=True
-        )
+        # Print model summary
+        if verbose > 0:
+            print("\nModel Summary:")
+            self.model.summary()
+            
+            # Print data shapes
+            if isinstance(x_train, (list, tuple)):
+                print("\nInput shapes:")
+                for i, x in enumerate(x_train):
+                    print(f"  Input {i+1}: {x.shape}")
+            else:
+                print(f"\nInput shape: {x_train.shape}")
+            print(f"Output shape: {y_train.shape}")
+            
+            if validation_data is not None:
+                val_x, val_y = validation_data
+                if isinstance(val_x, (list, tuple)):
+                    print("\nValidation input shapes:")
+                    for i, x in enumerate(val_x):
+                        print(f"  Val Input {i+1}: {x.shape}")
+                else:
+                    print(f"\nValidation input shape: {val_x.shape}")
+                print(f"Validation output shape: {val_y.shape}")
 
         # Train the model
         history = self.model.fit(
-            X_train,
+            x_train,
             y_train,
             epochs=epochs,
             batch_size=batch_size,
-            validation_split=validation_split,
-            callbacks=[early_stopping, checkpoint, self.lr_scheduler],
-            verbose=1
+            validation_data=validation_data,
+            validation_split=validation_split if validation_data is None else 0.0,
+            callbacks=callbacks,
+            verbose=verbose,
+            shuffle=False  # Important for time series data
         )
 
-        # Save final model with explicit format
-        self.model.save(self.model_path, save_format='tf')
+        # Save final model using the recommended Keras format
+        self.model.save(self.model_path, save_format='keras')
+        
+        # Store training history
+        self.history = history.history
+        
+        # Calculate and store metrics
+        if 'val_loss' in history.history:
+            best_epoch = np.argmin(history.history['val_loss']) + 1
+            self.metrics = {
+                'history': history.history,
+                'best_epoch': best_epoch,
+                'best_val_loss': np.min(history.history['val_loss']),
+                'final_loss': history.history['loss'][-1],
+                'final_val_loss': history.history['val_loss'][-1],
+                'final_mae': history.history['mae'][-1],
+                'final_val_mae': history.history['val_mae'][-1]
+            }
+        else:
+            best_epoch = np.argmin(history.history['loss']) + 1
+            self.metrics = {
+                'history': history.history,
+                'best_epoch': best_epoch,
+                'best_loss': np.min(history.history['loss']),
+                'final_loss': history.history['loss'][-1],
+                'final_mae': history.history['mae'][-1]
+            }
 
-        # Calculate metrics
-        self.metrics = {
-            'history': history.history,
-            'best_epoch': np.argmin(history.history['val_loss']) + 1,
-            'final_loss': history.history['loss'][-1],
-            'final_val_loss': history.history['val_loss'][-1],
-            'final_mae': history.history['mae'][-1],
-            'final_val_mae': history.history['val_mae'][-1]
-        }
+        if verbose > 0:
+            print("\nTraining completed!")
+            if 'val_loss' in history.history:
+                print(f"Best validation loss: {self.metrics['best_val_loss']:.4f} at epoch {best_epoch}")
+            print(f"Final training loss: {self.metrics['final_loss']:.4f}")
 
         return self.metrics
 

@@ -1,9 +1,10 @@
-import yfinance as yf
 import os
 import sys
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
+import pandas_market_calendars as mcal
+from .yfinance_utils import fetch_daily_yfinance_data
 import json
 import logging
 import time
@@ -44,84 +45,301 @@ class DataCollector:
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir)
             
-    def _get_cache_key(self, ticker: str, start_date: str, end_date: str) -> str:
-        """Generate cache key for a specific ticker and date range"""
-        return f"{ticker}_{start_date}_{end_date}.pkl"
+    def _get_cache_key(self, ticker: str, start_date: str, end_date: str, interval: str = '1d') -> str:
+        """Generate cache key for a specific ticker, date range, and interval"""
+        return f"{ticker}_{start_date}_{end_date}_{interval}.pkl"
     
-    def _cache_data(self, ticker: str, start_date: str, end_date: str, data: pd.DataFrame):
-        """Cache data to disk"""
-        cache_key = self._get_cache_key(ticker, start_date, end_date)
-        cache_path = os.path.join(self.cache_dir, cache_key)
-        data.to_pickle(cache_path)
-        self.logger.info(f"Cached data for {ticker} from {start_date} to {end_date}")
-        
-    def _load_cached_data(self, ticker: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-        """Load data from cache if available"""
-        cache_key = self._get_cache_key(ticker, start_date, end_date)
-        cache_path = os.path.join(self.cache_dir, cache_key)
-        
-        if os.path.exists(cache_path):
-            try:
-                data = pd.read_pickle(cache_path)
-                self.logger.info(f"Loaded cached data for {ticker} from {start_date} to {end_date}")
-                return data
-            except Exception as e:
-                self.logger.warning(f"Failed to load cached data: {e}")
-                return None
-        return None
-    
-    def get_stock_data(self, ticker: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+    def _cache_data(self, ticker: str, start_date: str, end_date: str, data: pd.DataFrame, interval: str = '1d'):
         """
-        Get historical stock data for a given ticker
+        Cache data to disk with proper handling of MultiIndex columns
         
         Args:
             ticker (str): Stock ticker symbol
-            start_date (str, optional): Start date in 'YYYY-MM-DD' format
-            end_date (str, optional): End date in 'YYYY-MM-DD' format
-            
-        Returns:
-            pd.DataFrame: Historical stock data
+            start_date (str): Start date in 'YYYY-MM-DD' format
+            end_date (str): End date in 'YYYY-MM-DD' format
+            data (pd.DataFrame): DataFrame to cache
+            interval (str): Data interval (default: '1d')
         """
-        if not start_date:
-            start_date = (datetime.now() - timedelta(days=self.default_lookback_years * 365)).strftime('%Y-%m-%d')
-        if not end_date:
-            end_date = datetime.now().strftime('%Y-%m-%d')
+        cache_key = self._get_cache_key(ticker, start_date, end_date, interval='1d')
+        cache_path = os.path.join(self.cache_dir, cache_key)
+        
+        # Ensure the cache directory exists
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        
+        # Convert to proper MultiIndex if needed before saving
+        if not isinstance(data.columns, pd.MultiIndex):
+            data.columns = pd.MultiIndex.from_product([[ticker], data.columns])
             
-        # Try to load from cache first
-        cached_data = self._load_cached_data(ticker, start_date, end_date)
-        if cached_data is not None:
-            return cached_data
+        # Save with protocol=4 for better compatibility
+        data.to_pickle(cache_path, protocol=4)
+        self.logger.info(f"Cached data for {ticker} from {start_date} to {end_date} with shape {data.shape}")
+        
+    def _load_cached_data(self, ticker: str, start_date: str, end_date: str, interval: str = '1d') -> Optional[pd.DataFrame]:
+        """
+        Load data from cache if available, with proper handling of MultiIndex columns
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            start_date (str): Start date in 'YYYY-MM-DD' format
+            end_date (str): End date in 'YYYY-MM-DD' format
+            interval (str): Data interval (default: '1d')
+        Returns:
+            Optional[pd.DataFrame]: Cached data if available and valid, None otherwise
+        """
+        cache_key = self._get_cache_key(ticker, start_date, end_date, interval='1d')
+        cache_path = os.path.join(self.cache_dir, cache_key)
+        
+        if not os.path.exists(cache_path):
+            self.logger.debug(f"No cache found at {cache_path}")
+            return None
             
         try:
-            self.logger.info(f"Fetching data for {ticker} from {start_date} to {end_date}")
-            data = yf.download(ticker, start=start_date, end=end_date)
+            # Load the data
+            data = pd.read_pickle(cache_path)
             
-            if data.empty:
-                raise ValueError(f"No data found for ticker: {ticker}")
+            # Basic validation
+            if not isinstance(data, pd.DataFrame) or data.empty:
+                self.logger.warning(f"Cached data for {ticker} is empty or invalid")
+                return None
+            # Ensure index is timezone-naive for all comparisons
+            if isinstance(data.index, pd.DatetimeIndex) and data.index.tz is not None:
+                data.index = data.index.tz_localize(None)
+
+            # Ensure we have proper MultiIndex columns
+            if not isinstance(data.columns, pd.MultiIndex):
+                self.logger.warning(f"Cached data for {ticker} has simple columns, converting to MultiIndex")
+                data.columns = pd.MultiIndex.from_product([[ticker], data.columns])
                 
-            # Cache the data
-            self._cache_data(ticker, start_date, end_date, data)
+            # Filter to requested date range
+            if isinstance(data.index, pd.DatetimeIndex):
+                start_dt = pd.to_datetime(start_date)
+                end_dt = pd.to_datetime(end_date)
+                data = data.loc[(data.index >= start_dt) & (data.index <= end_dt)]
+                
+            # --- Daily granularity validation ---
+            if isinstance(data.index, pd.DatetimeIndex):
+                # Check if all times are 00:00:00 (midnight)
+                intraday_idx = [dt for dt in data.index if getattr(dt, 'hour', 0) != 0]
+                if intraday_idx:
+                    self.logger.error(f"[CACHE VALIDATION] Intraday timestamps detected in cached data for {ticker}: {intraday_idx[:5]}")
+                    raise ValueError("Cached data contains intraday timestamps; expected daily granularity.")
+                # Check for duplicate days
+                if data.index.to_series().dt.date.duplicated().any():
+                    self.logger.error(f"[CACHE VALIDATION] Duplicate days detected in cached data for {ticker}.")
+                    raise ValueError("Cached data contains duplicate days; expected unique daily entries.")
+                # Check monotonic increasing
+                if not data.index.is_monotonic_increasing:
+                    self.logger.error(f"[CACHE VALIDATION] Index not monotonic increasing in cached data for {ticker}.")
+                    raise ValueError("Cached data index is not monotonic increasing.")
+                # Check date range coverage
+                expected_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days + 1
+                actual_days = len(data.index)
+                if actual_days < expected_days * 0.8:  # Allow some missing days for weekends/holidays
+                    self.logger.warning(f"[CACHE VALIDATION] Fewer days than expected in cached data for {ticker}: got {actual_days}, expected ~{expected_days}")
+            self.logger.info(f"Loaded cached data for {ticker} from {start_date} to {end_date}, shape: {data.shape}, interval: {interval}")
+            return data
             
+        except Exception as e:
+            self.logger.error(f"Error loading cached data from {cache_path}: {str(e)}", exc_info=True)
+            # Try to remove the corrupted cache file
+            try:
+                os.remove(cache_path)
+                self.logger.info(f"Removed corrupted cache file: {cache_path}")
+            except Exception as e2:
+                self.logger.warning(f"Failed to remove corrupted cache file {cache_path}: {str(e2)}")
+            return None
+    
+    def get_stock_data(self, ticker: str, start_date: Optional[str] = None, end_date: Optional[str] = None, min_days_required: int = 30):
+        """
+        Get historical stock data for a given ticker with proper date handling and validation.
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            start_date (str, optional): Start date in 'YYYY-MM-DD' format. Defaults to default_lookback_years ago.
+            end_date (str, optional): End date in 'YYYY-MM-DD' format. Defaults to yesterday.
+            min_days_required (int): Minimum number of days of data required. Defaults to 30.
+            
+        Returns:
+            pd.DataFrame: Historical stock data with properly named columns
+            
+        Raises:
+            ValueError: If data cannot be fetched or is insufficient
+        """
+        # Set default start date if not provided
+        if not start_date:
+            start_date = (datetime.now() - timedelta(days=self.default_lookback_years * 365)).strftime('%Y-%m-%d')
+            
+        # Set end date to yesterday to avoid getting intraday data for today
+        if not end_date:
+            end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            # If end_date is provided, ensure it's not today's date
+            end_dt = pd.to_datetime(end_date).date()
+            today = datetime.now().date()
+            if end_dt >= today:
+                end_date = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+                self.logger.info(f"Adjusted end_date to previous trading day: {end_date}")
+                
+        # Validate date range
+        start_dt = pd.to_datetime(start_date).date()
+        end_dt = pd.to_datetime(end_date).date()
+        
+        if start_dt >= end_dt:
+            raise ValueError(f"Start date ({start_date}) must be before end date ({end_date})")
+            
+        date_range = (end_dt - start_dt).days
+        if date_range < min_days_required:
+            self.logger.warning(f"Date range ({date_range} days) is less than minimum required ({min_days_required} days)")
+    
+        # Try to load from cache first
+        cached_data = self._load_cached_data(ticker, start_date, end_date, interval='1d')
+        if cached_data is not None:
+            # Ensure cached data has proper column names
+            if not isinstance(cached_data.columns, pd.MultiIndex):
+                cached_data.columns = pd.MultiIndex.from_product([[ticker], cached_data.columns])
+        # Try to load from cache first
+        cached_data = self._load_cached_data(ticker, start_date, end_date, interval='1d')
+        cache_is_valid = False
+        if cached_data is not None:
+            # Ensure cached data has proper column names
+            if not isinstance(cached_data.columns, pd.MultiIndex):
+                cached_data.columns = pd.MultiIndex.from_product([[ticker], cached_data.columns])
+            # Ensure sorted
+            if isinstance(cached_data.index, pd.DatetimeIndex):
+                cached_data = cached_data.sort_index()
+            # Reindex to NYSE trading days and forward-fill
+            nyse = mcal.get_calendar('NYSE')
+            expected_days = nyse.valid_days(start_date=start_date, end_date=end_date).tz_localize(None)
+            # Ensure index is tz-naive
+            if hasattr(cached_data.index, 'tz') and cached_data.index.tz is not None:
+                cached_data.index = cached_data.index.tz_localize(None)
+            cached_data = cached_data.reindex(expected_days)
+            missing = set(expected_days) - set(cached_data.index.dropna())
+            if missing:
+                # Try to explain missing days: weekends/holidays vs unexplained gaps
+                cal = mcal.get_calendar('NYSE')
+                holidays = set(cal.holidays().holidays)
+                missing_explained = [d for d in missing if d in holidays]
+                missing_unexplained = [d for d in missing if d not in holidays]
+                if missing_explained:
+                    self.logger.info(f"Missing trading days for {ticker} are NYSE holidays: {sorted([d.strftime('%Y-%m-%d') for d in missing_explained])}")
+                if missing_unexplained:
+                    self.logger.warning(f"Unexplained missing trading days for {ticker}: {sorted([d.strftime('%Y-%m-%d') for d in missing_unexplained])}")
+            # Interpolate missing values, then forward-fill as fallback
+            cached_data = cached_data.interpolate(method='time').ffill()
+            self.logger.info(f"[DEBUG] Cached data after reindex/ffill: shape={cached_data.shape}, last_70_dates={[str(d) for d in cached_data.index[-70:]]}")
+            self.logger.info(f"[DEBUG] Cached data last 5 rows:\n{cached_data.tail()}\nNaNs in last 5 rows: {cached_data.tail().isna().sum().sum()}")
+            self.logger.info(f"After NYSE reindex+ffill (cached): {ticker} shape={cached_data.shape}")
+            return cached_data
+        # If cache is missing or insufficient, fetch full range
+        try:
+            interval = '1d'  # Enforce daily interval for all yfinance fetches
+            self.logger.info(f"Fetching data for {ticker} from {start_date} to {end_date} (min {min_days_required} days required)")
+
+            # Download data with auto_adjust=True to handle splits and dividends
+            data = fetch_daily_yfinance_data(
+                ticker=ticker,
+                start=start_date,
+                end=end_date,
+                auto_adjust=True,
+                logger=self.logger,
+                min_days_required=min_days_required
+            )
+            # Debug: Log first 5 index values and columns of raw data
+            self.logger.info(f"[DEBUG] Raw data index (first 5): {list(data.index[:5]) if hasattr(data, 'index') else 'N/A'}")
+            self.logger.info(f"[DEBUG] Raw data columns: {list(data.columns) if hasattr(data, 'columns') else 'N/A'}")
+            
+            # Ensure we have a DataFrame with the correct structure
+            if not isinstance(data, pd.DataFrame) or data.empty:
+                raise ValueError(f"No data returned for {ticker}")
+                
+            # Convert to MultiIndex columns with ticker as first level
+            if not isinstance(data.columns, pd.MultiIndex):
+                data.columns = pd.MultiIndex.from_product([[ticker], data.columns])
+                
+            self.logger.info(f"Fetched data shape for {ticker}: {data.shape}, columns: {list(data.columns)}, interval: {interval}")
+            
+            # Check for NaN values
+            nan_cols = data.columns[data.isna().all()].tolist()
+            if nan_cols:
+                self.logger.warning(f"All-NaN columns for {ticker}: {nan_cols}")
+                # Drop columns that are all NaN
+                data = data.drop(columns=nan_cols)
+                
+            if data.empty or data.isna().all().all():
+                self.logger.error(f"Data for {ticker} is empty or all columns are NaN. Skipping.")
+                raise ValueError(f"No usable data for ticker: {ticker}")
+                
+            # --- Daily granularity validation ---
+            if isinstance(data.index, pd.DatetimeIndex):
+                intraday_idx = [dt for dt in data.index if getattr(dt, 'hour', 0) != 0]
+                if intraday_idx:
+                    self.logger.error(f"[FETCH VALIDATION] Intraday timestamps detected in fetched data for {ticker}: {intraday_idx[:5]}")
+                    raise ValueError("Fetched data contains intraday timestamps; expected daily granularity.")
+                if data.index.to_series().dt.date.duplicated().any():
+                    self.logger.error(f"[FETCH VALIDATION] Duplicate days detected in fetched data for {ticker}.")
+                    raise ValueError("Fetched data contains duplicate days; expected unique daily entries.")
+                if not data.index.is_monotonic_increasing:
+                    self.logger.error(f"[FETCH VALIDATION] Index not monotonic increasing in fetched data for {ticker}.")
+                    raise ValueError("Fetched data index is not monotonic increasing.")
+                expected_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days + 1
+            # Reindex to NYSE trading days and forward-fill
+            nyse = mcal.get_calendar('NYSE')
+            expected_days = nyse.valid_days(start_date=start_date, end_date=end_date).tz_localize(None)
+            # Ensure index is tz-naive
+            if hasattr(data.index, 'tz') and data.index.tz is not None:
+                data.index = data.index.tz_localize(None)
+            data = data.reindex(expected_days)
+            missing = set(expected_days) - set(data.index.dropna())
+            if missing:
+                # Try to explain missing days: weekends/holidays vs unexplained gaps
+                cal = mcal.get_calendar('NYSE')
+                holidays = set(cal.holidays().holidays)
+                missing_explained = [d for d in missing if d in holidays]
+                missing_unexplained = [d for d in missing if d not in holidays]
+                if missing_explained:
+                    self.logger.info(f"Missing trading days for {ticker} are NYSE holidays: {sorted([d.strftime('%Y-%m-%d') for d in missing_explained])}")
+                if missing_unexplained:
+                    self.logger.warning(f"Unexplained missing trading days for {ticker}: {sorted([d.strftime('%Y-%m-%d') for d in missing_unexplained])}")
+            # Interpolate missing values, then forward-fill as fallback
+            data = data.interpolate(method='time').ffill()
+            self.logger.info(f"[DEBUG] Fresh data after reindex/ffill: shape={data.shape}, last_70_dates={[str(d) for d in data.index[-70:]]}")
+            self.logger.info(f"[DEBUG] Fresh data last 5 rows:\n{data.tail()}\nNaNs in last 5 rows: {data.tail().isna().sum().sum()}")
+            self._cache_data(ticker, start_date, end_date, data, interval=interval)
             return data
             
         except Exception as e:
             self.logger.error(f"Error fetching data for {ticker}: {str(e)}")
             raise ValueError(f"Failed to fetch data for {ticker}: {str(e)}")
-            
-    def get_multiple_stocks_data(self, tickers: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, pd.DataFrame]:
+           
+    def get_multiple_stocks_data(
+        self, 
+        tickers: List[str], 
+        start_date: Optional[str] = None, 
+        end_date: Optional[str] = None,
+        min_days_required: int = 30,
+        require_all: bool = False
+    ) -> Dict[str, pd.DataFrame]:
         """
-        Get historical data for multiple stocks
+        Get historical data for multiple stocks with proper date handling and validation.
         
         Args:
             tickers (List[str]): List of stock ticker symbols
-            start_date (str, optional): Start date in 'YYYY-MM-DD' format
-            end_date (str, optional): End date in 'YYYY-MM-DD' format
+            start_date (str, optional): Start date in 'YYYY-MM-DD' format. Defaults to default_lookback_years ago.
+            end_date (str, optional): End date in 'YYYY-MM-DD' format. Defaults to yesterday.
+            min_days_required (int): Minimum number of days of data required. Defaults to 30.
+            require_all (bool): If True, raises an error if any ticker fails. If False, returns partial results.
             
         Returns:
             Dict[str, pd.DataFrame]: Dictionary of DataFrames, one per ticker
             
         Raises:
             ValueError: If no valid tickers are provided or if data cannot be fetched for any ticker
+            
+        Note:
+            - If require_all=False (default), the method will return data for as many tickers as possible,
+              and failed tickers will be logged as warnings.
+            - If require_all=True, any failure will raise an exception.
         """
         if not tickers:
             raise ValueError("No tickers provided")
@@ -133,20 +351,37 @@ class DataCollector:
             try:
                 # Validate ticker first
                 if not self.validate_ticker(ticker):
-                    self.logger.warning(f"Invalid or non-existent ticker: {ticker}")
-                    failed_tickers.append(ticker)
+                    error_msg = f"Invalid or non-existent ticker: {ticker}"
+                    if require_all:
+                        raise ValueError(error_msg)
+                    self.logger.warning(error_msg)
+                    failed_tickers.append((ticker, error_msg))
                     continue
                     
-                # Get data for valid ticker
-                data = self.get_stock_data(ticker, start_date, end_date)
+                # Get data for valid ticker with min_days_required
+                data = self.get_stock_data(
+                    ticker=ticker,
+                    start_date=start_date,
+                    end_date=end_date,
+                    min_days_required=min_days_required
+                )
+                
                 if not data.empty:
                     data_dict[ticker] = data
+                    self.logger.info(f"Successfully fetched data for {ticker} ({len(data)} days)")
                 else:
-                    self.logger.warning(f"No data available for ticker: {ticker}")
-                    failed_tickers.append(ticker)
+                    error_msg = f"No data available for ticker: {ticker}"
+                    if require_all:
+                        raise ValueError(error_msg)
+                    self.logger.warning(error_msg)
+                    failed_tickers.append((ticker, error_msg))
+                    
             except Exception as e:
-                self.logger.error(f"Error fetching data for {ticker}: {str(e)}", exc_info=True)
-                failed_tickers.append(ticker)
+                error_msg = str(e)
+                self.logger.error(f"Error fetching data for {ticker}: {error_msg}", exc_info=True)
+                if require_all:
+                    raise
+                failed_tickers.append((ticker, error_msg))
         
         # If we couldn't get data for any ticker, raise an error
         if not data_dict and tickers:
@@ -168,7 +403,8 @@ class DataCollector:
         try:
             # This is a simplified version - in production you might want to use a more robust method
             # or cache the results
-            return ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META']  # Example tickers
+            from config.tickers import EXTENDED_TICKERS
+            return EXTENDED_TICKERS
         except Exception as e:
             self.logger.error(f"Error getting available tickers: {str(e)}")
             return []
@@ -204,14 +440,11 @@ class DataCollector:
             
             # Try to fetch minimal data to validate ticker
             try:
-                data = yf.download(
-                    ticker,
-                    period='1d',
-                    progress=False,
-                    threads=False,
-                    # Remove show_errors as it's not a valid parameter
-                    # show_errors is handled by the try-except block
-                )
+                data = fetch_daily_yfinance_data(
+                        ticker,
+                        period='1d',
+                        logger=self.logger
+                    )
             except Exception as e:
                 self.logger.debug(f"Failed to download data for {ticker}: {str(e)}")
                 return False
@@ -393,11 +626,18 @@ class DataCollector:
             self.logger.error(f"Error calculating risk metrics: {str(e)}", exc_info=True)
             return metrics
 
-    def get_portfolio_data(self, tickers: List[str], weights: Dict[str, float], 
-                         start_date: str, end_date: str, 
-                         risk_free_rate: float = 0.0) -> pd.DataFrame:
+    def get_portfolio_data(
+        self, 
+        tickers: List[str], 
+        weights: Dict[str, float], 
+        start_date: str, 
+        end_date: str, 
+        risk_free_rate: float = 0.0,
+        min_days_required: int = 30,
+        require_all: bool = True
+    ) -> pd.DataFrame:
         """
-        Get comprehensive portfolio-level data for analysis and optimization
+        Get comprehensive portfolio-level data for analysis and optimization with proper date validation.
         
         Args:
             tickers (List[str]): List of stock tickers in the portfolio
@@ -405,12 +645,18 @@ class DataCollector:
             start_date (str): Start date for data in 'YYYY-MM-DD' format
             end_date (str): End date for data in 'YYYY-MM-DD' format
             risk_free_rate (float): Annual risk-free rate for calculating risk-adjusted returns
+            min_days_required (int): Minimum number of days of data required. Defaults to 30.
+            require_all (bool): If True, raises an error if any ticker fails. If False, continues with available tickers.
             
         Returns:
             pd.DataFrame: DataFrame with portfolio metrics and component data
             
         Raises:
             ValueError: If input validation fails or data cannot be retrieved
+            
+        Note:
+            - If require_all=True (default), any failure to fetch data for a ticker will raise an exception.
+            - If require_all=False, the method will continue with available tickers and adjust weights proportionally.
         """
         # Input validation
         if not tickers:
@@ -419,19 +665,56 @@ class DataCollector:
         if not weights:
             raise ValueError("Weights dictionary cannot be empty")
             
-        if abs(sum(weights.values()) - 1.0) > 0.01:  # Allow for small floating point differences
-            self.logger.warning(f"Weights sum to {sum(weights.values()):.4f}, normalizing to 1.0")
-            total_weight = sum(weights.values())
-            weights = {k: v/total_weight for k, v in weights.items()}
+        if set(tickers) != set(weights.keys()):
+            raise ValueError("Tickers in weights must match the provided tickers list")
+            
+        # Validate dates
+        try:
+            start_dt = pd.to_datetime(start_date).date()
+            end_dt = pd.to_datetime(end_date).date()
+            
+            if start_dt >= end_dt:
+                raise ValueError(f"Start date ({start_date}) must be before end date ({end_date})")
+                
+            days_range = (end_dt - start_dt).days
+            if days_range < min_days_required:
+                self.logger.warning(f"Date range ({days_range} days) is less than minimum required ({min_days_required} days)")
+                
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid date format. Use 'YYYY-MM-DD': {str(e)}")
+        
+        # Normalize weights if they don't sum to 1.0
+        weight_sum = sum(weights.values())
+        if abs(weight_sum - 1.0) > 0.01:  # Allow for small floating point differences
+            self.logger.warning(f"Weights sum to {weight_sum:.4f}, normalizing to 1.0")
+            weights = {k: v/weight_sum for k, v in weights.items()}
         
         try:
-            # Get data for all tickers
+            # Get data for all tickers with proper error handling
             self.logger.info(f"Fetching data for {len(tickers)} tickers from {start_date} to {end_date}")
-            data_dict = self.get_multiple_stocks_data(tickers, start_date, end_date)
+            data_dict = self.get_multiple_stocks_data(
+                tickers=tickers,
+                start_date=start_date,
+                end_date=end_date,
+                min_days_required=min_days_required,
+                require_all=require_all
+            )
             
             if not data_dict:
                 raise ValueError("No data returned for any tickers")
                 
+            # Check if we have all requested tickers
+            missing_tickers = set(tickers) - set(data_dict.keys())
+            if missing_tickers:
+                if require_all:
+                    raise ValueError(f"Failed to fetch data for required tickers: {', '.join(missing_tickers)}")
+                else:
+                    self.logger.warning(f"Proceeding with available tickers. Missing data for: {', '.join(missing_tickers)}")
+                    # Adjust weights for available tickers
+                    total_weight = sum(w for t, w in weights.items() if t in data_dict)
+                    weights = {t: w/total_weight for t, w in weights.items() if t in data_dict}
+                    tickers = list(weights.keys())  # Update tickers list
+                    
             # Find common date index across all tickers
             common_index = None
             for ticker, df in data_dict.items():
@@ -440,8 +723,10 @@ class DataCollector:
                 else:
                     common_index = common_index.intersection(df.index)
             
-            if len(common_index) < 5:  # Need at least 5 data points
-                raise ValueError("Insufficient common data points across tickers")
+            if len(common_index) < min_days_required:
+                raise ValueError(f"Insufficient common data points across tickers. Need at least {min_days_required}, got {len(common_index)}")
+            
+            self.logger.info(f"Found {len(common_index)} common trading days from {common_index.min().date()} to {common_index.max().date()}")
             
             # Initialize portfolio data structure
             portfolio_metrics = pd.DataFrame(index=common_index)
@@ -674,7 +959,12 @@ class DataCollector:
             
             # 2. Interest Rates (10-Year Treasury Yield)
             try:
-                rates_data = yf.download('^TNX', start=start_date, end=end_date, progress=False)['Close']
+                rates_data = fetch_daily_yfinance_data(
+                        '^TNX',
+                        start=start_date,
+                        end=end_date,
+                        logger=self.logger
+                    )['Close']
                 if not rates_data.empty:
                     macro_data['Interest_Rate'] = rates_data / 100
                 else:
@@ -686,7 +976,12 @@ class DataCollector:
             
             # 3. VIX (Market Volatility Index)
             try:
-                vix_data = yf.download('^VIX', start=start_date, end=end_date, progress=False)['Close']
+                vix_data = fetch_daily_yfinance_data(
+                        '^VIX',
+                        start=start_date,
+                        end=end_date,
+                        logger=self.logger
+                    )['Close']
                 if not vix_data.empty:
                     macro_data['VIX'] = vix_data / 100
                 else:
@@ -746,7 +1041,11 @@ class DataCollector:
             # Update stock data
             for ticker in self.tickers:
                 try:
-                    data = yf.download(ticker, period=period)
+                    data = fetch_daily_yfinance_data(
+                        ticker,
+                        period=period,
+                        logger=self.logger
+                    )
                     if not data.empty:
                         self._cache_data(ticker, self.start_date, self.end_date, data)
                 except Exception as e:
